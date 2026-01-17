@@ -1,0 +1,740 @@
+/**
+ * 🎭 WHITEMEME BOT — payout.js (PAYOUT MODULE)
+ * 
+ * ✅ Contains all payout calculation and execution logic
+ * ✅ Separated from main bot logic for better organization
+ * ✅ Can be imported into index.js
+ * ✅ Admin-only functions with proper security
+ */
+
+const { 
+  Connection, 
+  PublicKey, 
+  LAMPORTS_PER_SOL, 
+  SystemProgram, 
+  Transaction, 
+  sendAndConfirmTransaction 
+} = require('@solana/web3.js');
+
+/* =========================
+   PAYOUT MODULE CONFIGURATION
+========================= */
+let db;
+let payer;
+let connection;
+let adminCheckFunction;
+
+// Configuration from environment
+let MIN_HOLDER_PCT = 0.0004;
+let MIN_HOLD_HOURS = 24;
+let DAILY_PAYOUT_PCT = 0.20;
+let MIN_PAYOUT_SOL = 0.00001;
+let MAX_PAYOUTS_PER_ROUND = 300;
+let MAX_PAYOUT_RECIPIENTS = 80;
+let TX_DELAY_MS = 350;
+let PAYOUT_WALLET_BUFFER_LAMPORTS = 2_000_000;
+
+/* =========================
+   MODULE INITIALIZATION
+========================= */
+function initPayoutModule(config) {
+  db = config.db;
+  payer = config.payer;
+  connection = config.connection;
+  adminCheckFunction = config.isAdmin || (() => false);
+  
+  // Update configuration if provided
+  if (config.config) {
+    MIN_HOLDER_PCT = config.config.MIN_HOLDER_PCT || MIN_HOLDER_PCT;
+    MIN_HOLD_HOURS = config.config.MIN_HOLD_HOURS || MIN_HOLD_HOURS;
+    DAILY_PAYOUT_PCT = config.config.DAILY_PAYOUT_PCT || DAILY_PAYOUT_PCT;
+    MIN_PAYOUT_SOL = config.config.MIN_PAYOUT_SOL || MIN_PAYOUT_SOL;
+    MAX_PAYOUTS_PER_ROUND = config.config.MAX_PAYOUTS_PER_ROUND || MAX_PAYOUTS_PER_ROUND;
+    MAX_PAYOUT_RECIPIENTS = config.config.MAX_PAYOUT_RECIPIENTS || MAX_PAYOUT_RECIPIENTS;
+    TX_DELAY_MS = config.config.TX_DELAY_MS || TX_DELAY_MS;
+    PAYOUT_WALLET_BUFFER_LAMPORTS = config.config.PAYOUT_WALLET_BUFFER_LAMPORTS || PAYOUT_WALLET_BUFFER_LAMPORTS;
+  }
+  
+  console.log('💰 Payout Module initialized');
+}
+
+/* =========================
+   HELPER FUNCTIONS
+========================= */
+const now = () => Date.now();
+
+function fmtSol(x) {
+  return Number(x || 0).toFixed(4);
+}
+
+function monospace(text) {
+  return `\`${text}\``;
+}
+
+function getToken(ca) {
+  return db.prepare(`SELECT * FROM tokens WHERE ca=?`).get(ca);
+}
+
+function getMeta(ca) {
+  return db.prepare(`SELECT * FROM token_meta WHERE ca=?`).get(ca);
+}
+
+function getRewardsPool(ca) {
+  const dep = db.prepare(`SELECT COALESCE(SUM(reward_sol),0) AS pool FROM deposits WHERE ca=?`).get(ca);
+  const paid = db.prepare(`SELECT COALESCE(SUM(sol_amount),0) AS paid FROM payouts WHERE ca=?`).get(ca);
+  return Math.max(0, Number(dep.pool || 0) - Number(paid.paid || 0));
+}
+
+function countHoldersForToken(ca) {
+  const r = db.prepare(`SELECT COUNT(*) AS c FROM holders WHERE ca=?`).get(ca);
+  return Number(r?.c || 0);
+}
+
+async function getWalletTokenBalanceUi(wallet, mint) {
+  const owner = new PublicKey(wallet);
+  const m = new PublicKey(mint);
+  const res = await connection.getParsedTokenAccountsByOwner(owner, { mint: m }, 'confirmed');
+  let total = 0;
+  for (const acc of res.value || []) {
+    const ui = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+    total += Number(ui || 0);
+  }
+  return total;
+}
+
+async function getMintSupplyAndDecimals(mint) {
+  const pk = new PublicKey(mint);
+  const supply = await connection.getTokenSupply(pk, 'confirmed');
+  const decimals = Number(supply?.value?.decimals ?? 0);
+  const amount = Number(supply?.value?.amount ?? 0);
+  const uiAmount = Number(supply?.value?.uiAmount ?? 0);
+  return { decimals, rawAmount: amount, uiAmount };
+}
+
+/* =========================
+   PAYOUT ELIGIBILITY CHECK
+========================= */
+function getPayoutEligibility(tokenCA, wallet, balance) {
+  // Check if holder registered
+  const holder = db.prepare(`SELECT registered_at FROM holders WHERE ca=? AND wallet=?`).get(tokenCA, wallet);
+  if (!holder) return { eligible: false, reason: 'not_registered' };
+  
+  // Check hold time
+  const registeredAt = Number(holder.registered_at || 0);
+  const holdHours = (now() - registeredAt) / (1000 * 60 * 60);
+  
+  if (holdHours < MIN_HOLD_HOURS) {
+    return { 
+      eligible: false, 
+      reason: 'hold_time', 
+      hours: holdHours,
+      required: MIN_HOLD_HOURS 
+    };
+  }
+  
+  // Check token status
+  const token = getToken(tokenCA);
+  if (!token || token.status !== 'ACTIVE') {
+    return { eligible: false, reason: 'token_inactive' };
+  }
+  
+  // Check token supply
+  const supply = db.prepare(`SELECT uiAmount FROM token_meta WHERE ca=?`).get(tokenCA);
+  const supplyUi = Number(supply?.uiAmount || 0);
+  
+  if (supplyUi <= 0) {
+    return { eligible: false, reason: 'supply_unknown' };
+  }
+  
+  // Check minimum percentage
+  const holderPct = balance / supplyUi;
+  if (holderPct < MIN_HOLDER_PCT) {
+    return { 
+      eligible: false, 
+      reason: 'min_percentage', 
+      currentPct: holderPct * 100,
+      requiredPct: MIN_HOLDER_PCT * 100 
+    };
+  }
+  
+  return { eligible: true, holdHours, holderPct: holderPct * 100 };
+}
+
+/* =========================
+   PAYOUT CALCULATION
+========================= */
+async function calculatePayoutsForToken(tokenCA) {
+  console.log(`🧮 Calculating payouts for token: ${tokenCA.slice(0, 16)}...`);
+  
+  const pool = getRewardsPool(tokenCA);
+  if (pool < MIN_PAYOUT_SOL) {
+    return { 
+      totalPayout: 0, 
+      recipients: [], 
+      message: `Pool too small: ${fmtSol(pool)} SOL < ${fmtSol(MIN_PAYOUT_SOL)} SOL minimum`,
+      pool 
+    };
+  }
+  
+  // Get all holders for this token
+  const holders = db.prepare(`
+    SELECT h.wallet, h.registered_at 
+    FROM holders h 
+    WHERE h.ca=? 
+    ORDER BY h.registered_at ASC
+    LIMIT ${MAX_PAYOUT_RECIPIENTS}
+  `).all(tokenCA);
+  
+  if (!holders.length) {
+    return { 
+      totalPayout: 0, 
+      recipients: [], 
+      message: 'No holders registered',
+      pool 
+    };
+  }
+  
+  // Get token supply
+  const supply = db.prepare(`SELECT uiAmount FROM token_meta WHERE ca=?`).get(tokenCA);
+  const supplyUi = Number(supply?.uiAmount || 0);
+  
+  if (supplyUi <= 0) {
+    return { 
+      totalPayout: 0, 
+      recipients: [], 
+      message: 'Token supply unknown',
+      pool 
+    };
+  }
+  
+  const eligibleRecipients = [];
+  let totalWeight = 0;
+  
+  // Check eligibility for each holder
+  console.log(`🔍 Checking ${holders.length} holders for eligibility...`);
+  
+  for (const holder of holders) {
+    try {
+      const balance = await getWalletTokenBalanceUi(holder.wallet, tokenCA);
+      
+      if (balance <= 0) {
+        console.log(`⚠️ Holder ${holder.wallet.slice(0, 8)}... has zero balance`);
+        continue;
+      }
+      
+      const eligibility = getPayoutEligibility(tokenCA, holder.wallet, balance);
+      
+      if (eligibility.eligible) {
+        const holderWeight = balance / supplyUi;
+        eligibleRecipients.push({
+          wallet: holder.wallet,
+          balance,
+          weight: holderWeight,
+          holdHours: eligibility.holdHours,
+          holderPct: eligibility.holderPct
+        });
+        totalWeight += holderWeight;
+        console.log(`✅ Eligible: ${holder.wallet.slice(0, 8)}... (${balance.toFixed(2)} tokens, ${eligibility.holderPct.toFixed(4)}%)`);
+      } else {
+        console.log(`❌ Not eligible: ${holder.wallet.slice(0, 8)}... (${eligibility.reason})`);
+      }
+    } catch (error) {
+      console.log(`⚠️ Error checking holder ${holder.wallet.slice(0, 8)}...:`, error.message);
+    }
+  }
+  
+  if (!eligibleRecipients.length) {
+    return { 
+      totalPayout: 0, 
+      recipients: [], 
+      message: 'No eligible holders',
+      pool,
+      supplyUi 
+    };
+  }
+  
+  // Calculate payouts
+  const dailyPayoutAmount = pool * DAILY_PAYOUT_PCT;
+  const actualPayoutAmount = Math.min(dailyPayoutAmount, pool);
+  
+  const payouts = [];
+  let totalToPay = 0;
+  let recipientsCount = 0;
+  
+  console.log(`💰 Calculating ${eligibleRecipients.length} eligible recipients...`);
+  console.log(`🏦 Pool: ${fmtSol(pool)} SOL, Daily rate: ${DAILY_PAYOUT_PCT * 100}%, To distribute: ${fmtSol(actualPayoutAmount)} SOL`);
+  
+  for (const recipient of eligibleRecipients) {
+    if (recipientsCount >= MAX_PAYOUTS_PER_ROUND) {
+      console.log(`⚠️ Reached max recipients limit: ${MAX_PAYOUTS_PER_ROUND}`);
+      break;
+    }
+    
+    const share = recipient.weight / totalWeight;
+    const payoutAmount = actualPayoutAmount * share;
+    
+    if (payoutAmount >= MIN_PAYOUT_SOL) {
+      payouts.push({
+        wallet: recipient.wallet,
+        amount: payoutAmount,
+        share: share * 100,
+        balance: recipient.balance,
+        holdHours: recipient.holdHours,
+        holderPct: recipient.holderPct
+      });
+      totalToPay += payoutAmount;
+      recipientsCount++;
+      
+      console.log(`📊 Payout: ${recipient.wallet.slice(0, 8)}... = ${fmtSol(payoutAmount)} SOL (${(share * 100).toFixed(4)}%)`);
+    } else {
+      console.log(`⚠️ Below min: ${recipient.wallet.slice(0, 8)}... = ${fmtSol(payoutAmount)} SOL < ${fmtSol(MIN_PAYOUT_SOL)} SOL min`);
+    }
+  }
+  
+  console.log(`✅ Calculation complete: ${payouts.length} payouts totaling ${fmtSol(totalToPay)} SOL`);
+  
+  return {
+    totalPayout: totalToPay,
+    recipients: payouts,
+    pool,
+    supplyUi,
+    eligibleCount: eligibleRecipients.length,
+    message: `Calculated ${payouts.length} payouts totaling ${fmtSol(totalToPay)} SOL`
+  };
+}
+
+/* =========================
+   PAYOUT EXECUTION
+========================= */
+async function executePayoutsForToken(tokenCA) {
+  console.log(`🚀 Executing payouts for token: ${tokenCA.slice(0, 16)}...`);
+  
+  // Step 1: Calculate payouts
+  const calculation = await calculatePayoutsForToken(tokenCA);
+  
+  if (calculation.totalPayout <= 0 || !calculation.recipients.length) {
+    console.log(`❌ No payouts to execute: ${calculation.message}`);
+    return {
+      success: false,
+      message: calculation.message,
+      paid: 0,
+      recipients: 0,
+      transactions: []
+    };
+  }
+  
+  // Step 2: Check wallet balance
+  const payerBalance = await connection.getBalance(payer.publicKey);
+  const requiredBalance = Math.ceil(calculation.totalPayout * LAMPORTS_PER_SOL + PAYOUT_WALLET_BUFFER_LAMPORTS);
+  
+  if (payerBalance < requiredBalance) {
+    const errorMsg = `Insufficient balance in payout wallet: ${fmtSol(payerBalance / LAMPORTS_PER_SOL)} SOL < ${fmtSol(requiredBalance / LAMPORTS_PER_SOL)} SOL required`;
+    console.log(`❌ ${errorMsg}`);
+    return {
+      success: false,
+      message: errorMsg,
+      paid: 0,
+      recipients: 0,
+      transactions: []
+    };
+  }
+  
+  console.log(`✅ Wallet balance sufficient: ${fmtSol(payerBalance / LAMPORTS_PER_SOL)} SOL >= ${fmtSol(requiredBalance / LAMPORTS_PER_SOL)} SOL required`);
+  
+  // Step 3: Execute payouts
+  const transactions = [];
+  let totalPaid = 0;
+  let successfulRecipients = 0;
+  
+  console.log(`📤 Sending ${calculation.recipients.length} payouts...`);
+  
+  for (const payout of calculation.recipients) {
+    try {
+      const lamports = Math.floor(payout.amount * LAMPORTS_PER_SOL);
+      if (lamports <= 0) {
+        console.log(`⚠️ Zero lamports for ${payout.wallet.slice(0, 8)}..., skipping`);
+        continue;
+      }
+      
+      const to = new PublicKey(payout.wallet);
+      const tx = new Transaction().add(
+        SystemProgram.transfer({ 
+          fromPubkey: payer.publicKey, 
+          toPubkey: to, 
+          lamports 
+        })
+      );
+      
+      console.log(`🔄 Sending ${fmtSol(payout.amount)} SOL to ${payout.wallet.slice(0, 8)}...`);
+      
+      const sig = await sendAndConfirmTransaction(connection, tx, [payer], { 
+        commitment: 'confirmed',
+        skipPreflight: false,
+        preflightCommitment: 'confirmed'
+      });
+      
+      // Save payout to database
+      db.prepare(`
+        INSERT INTO payouts (payout_sig, ca, to_wallet, sol_amount, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(sig, tokenCA, payout.wallet, payout.amount, now());
+      
+      // Update holder stats
+      db.prepare(`
+        UPDATE holders 
+        SET total_paid = total_paid + ?, last_paid_at = ?
+        WHERE ca=? AND wallet=?
+      `).run(payout.amount, now(), tokenCA, payout.wallet);
+      
+      transactions.push({
+        wallet: payout.wallet,
+        amount: payout.amount,
+        signature: sig,
+        success: true,
+        timestamp: now()
+      });
+      
+      totalPaid += payout.amount;
+      successfulRecipients++;
+      
+      console.log(`✅ Paid ${fmtSol(payout.amount)} SOL to ${payout.wallet.slice(0, 8)}...: ${sig.slice(0, 16)}...`);
+      
+      // Delay between transactions to avoid rate limiting
+      if (TX_DELAY_MS > 0) {
+        await new Promise(resolve => setTimeout(resolve, TX_DELAY_MS));
+      }
+      
+    } catch (error) {
+      console.log(`❌ Failed to pay ${payout.wallet.slice(0, 8)}...:`, error.message);
+      transactions.push({
+        wallet: payout.wallet,
+        amount: payout.amount,
+        error: error.message,
+        success: false,
+        timestamp: now()
+      });
+    }
+  }
+  
+  console.log(`🎉 Payout execution complete: ${successfulRecipients} successful, ${calculation.recipients.length - successfulRecipients} failed`);
+  
+  return {
+    success: successfulRecipients > 0,
+    message: `Executed ${successfulRecipients} payouts totaling ${fmtSol(totalPaid)} SOL`,
+    paid: totalPaid,
+    recipients: successfulRecipients,
+    failed: calculation.recipients.length - successfulRecipients,
+    transactions,
+    calculation
+  };
+}
+
+/* =========================
+   MANUAL PAYOUT FOR ALL TOKENS
+========================= */
+async function manualPayoutAllTokens() {
+  console.log('🚀 Starting manual payout for ALL active tokens...');
+  
+  const activeTokens = db.prepare(`
+    SELECT t.ca, 
+           COALESCE(tm.display_name, tm.name) as name,
+           COALESCE(tm.display_symbol, tm.symbol) as symbol,
+           t.status
+    FROM tokens t
+    LEFT JOIN token_meta tm ON tm.ca=t.ca
+    WHERE t.status='ACTIVE'
+    ORDER BY t.created_at ASC
+  `).all();
+  
+  if (!activeTokens.length) {
+    console.log('❌ No active tokens found');
+    return { 
+      success: false, 
+      message: 'No active tokens found',
+      results: [] 
+    };
+  }
+  
+  console.log(`📊 Found ${activeTokens.length} active tokens`);
+  
+  const results = [];
+  let totalPaidAll = 0;
+  let totalRecipientsAll = 0;
+  let successfulTokens = 0;
+  
+  for (const token of activeTokens) {
+    console.log(`\n🔄 Processing: ${token.name || token.ca} (${token.symbol || 'N/A'})`);
+    
+    const tokenCA = token.ca;
+    const pool = getRewardsPool(tokenCA);
+    const holders = countHoldersForToken(tokenCA);
+    
+    console.log(`   Pool: ${fmtSol(pool)} SOL, Holders: ${holders}`);
+    
+    if (pool < MIN_PAYOUT_SOL) {
+      console.log(`   ⚠️ Pool too small, skipping`);
+      results.push({
+        tokenCA,
+        tokenName: token.name || 'Unknown',
+        tokenSymbol: token.symbol || 'N/A',
+        success: false,
+        message: `Pool too small: ${fmtSol(pool)} SOL < ${fmtSol(MIN_PAYOUT_SOL)} SOL minimum`,
+        paid: 0,
+        recipients: 0
+      });
+      continue;
+    }
+    
+    if (holders === 0) {
+      console.log(`   ⚠️ No holders, skipping`);
+      results.push({
+        tokenCA,
+        tokenName: token.name || 'Unknown',
+        tokenSymbol: token.symbol || 'N/A',
+        success: false,
+        message: 'No holders registered',
+        paid: 0,
+        recipients: 0
+      });
+      continue;
+    }
+    
+    // Execute payout for this token
+    const result = await executePayoutsForToken(tokenCA);
+    
+    results.push({
+      tokenCA,
+      tokenName: token.name || 'Unknown',
+      tokenSymbol: token.symbol || 'N/A',
+      ...result
+    });
+    
+    totalPaidAll += result.paid || 0;
+    totalRecipientsAll += result.recipients || 0;
+    
+    if (result.success) {
+      successfulTokens++;
+    }
+    
+    // Delay between tokens to avoid overwhelming the system
+    console.log(`   ⏳ Waiting 2 seconds before next token...`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  
+  const summaryMessage = `Manual payout completed: ${successfulTokens}/${activeTokens.length} tokens successful, ${totalRecipientsAll} recipients paid ${fmtSol(totalPaidAll)} SOL`;
+  console.log(`\n${summaryMessage}`);
+  
+  return {
+    success: totalPaidAll > 0,
+    message: summaryMessage,
+    totalPaid: totalPaidAll,
+    totalRecipients: totalRecipientsAll,
+    successfulTokens,
+    totalTokens: activeTokens.length,
+    results
+  };
+}
+
+/* =========================
+   PAYOUT STATUS & REPORTS
+========================= */
+function getPayoutStats(tokenCA = null) {
+  if (tokenCA) {
+    // Token-specific stats
+    const totalPayouts = db.prepare(`SELECT COUNT(*) as count, COALESCE(SUM(sol_amount), 0) as total FROM payouts WHERE ca=?`).get(tokenCA);
+    const recentPayouts = db.prepare(`SELECT to_wallet, sol_amount, created_at FROM payouts WHERE ca=? ORDER BY created_at DESC LIMIT 10`).all(tokenCA);
+    
+    const topHolders = db.prepare(`
+      SELECT h.wallet, h.total_paid, h.last_paid_at,
+             (SELECT COUNT(*) FROM payouts p WHERE p.ca=h.ca AND p.to_wallet=h.wallet) as payout_count
+      FROM holders h
+      WHERE h.ca=?
+      ORDER BY h.total_paid DESC
+      LIMIT 5
+    `).all(tokenCA);
+    
+    return {
+      tokenCA,
+      totalPayouts: Number(totalPayouts.count || 0),
+      totalPaid: Number(totalPayouts.total || 0),
+      recentPayouts,
+      topHolders
+    };
+  } else {
+    // Global stats
+    const totalPayouts = db.prepare(`SELECT COUNT(*) as count, COALESCE(SUM(sol_amount), 0) as total FROM payouts`).get();
+    const tokensWithPayouts = db.prepare(`SELECT COUNT(DISTINCT ca) as count FROM payouts`).get();
+    const uniqueRecipients = db.prepare(`SELECT COUNT(DISTINCT to_wallet) as count FROM payouts`).get();
+    
+    const recentPayouts = db.prepare(`
+      SELECT p.ca, p.to_wallet, p.sol_amount, p.created_at,
+             COALESCE(tm.display_name, tm.name) as token_name
+      FROM payouts p
+      LEFT JOIN token_meta tm ON tm.ca=p.ca
+      ORDER BY p.created_at DESC
+      LIMIT 10
+    `).all();
+    
+    const topTokens = db.prepare(`
+      SELECT p.ca, 
+             COALESCE(tm.display_name, tm.name) as token_name,
+             COUNT(*) as payout_count,
+             SUM(p.sol_amount) as total_paid
+      FROM payouts p
+      LEFT JOIN token_meta tm ON tm.ca=p.ca
+      GROUP BY p.ca
+      ORDER BY total_paid DESC
+      LIMIT 5
+    `).all();
+    
+    return {
+      global: {
+        totalPayouts: Number(totalPayouts.count || 0),
+        totalPaid: Number(totalPayouts.total || 0),
+        tokensWithPayouts: Number(tokensWithPayouts.count || 0),
+        uniqueRecipients: Number(uniqueRecipients.count || 0)
+      },
+      recentPayouts,
+      topTokens
+    };
+  }
+}
+
+function generatePayoutReport(result, isSingleToken = false) {
+  let report = '';
+  
+  if (isSingleToken) {
+    const meta = getMeta(result.tokenCA);
+    report += `📊 TOKEN PAYOUT REPORT\n\n`;
+    report += `Token: ${result.tokenName || meta?.display_name || meta?.name || 'Unknown'}\n`;
+    report += `Status: ${result.success ? '✅ SUCCESS' : '⚠️ PARTIAL'}\n`;
+    report += `Message: ${result.message}\n\n`;
+    
+    if (result.recipients && result.recipients > 0) {
+      report += `📈 Payout Details:\n`;
+      report += `Paid: ${fmtSol(result.paid || 0)} SOL 💰\n`;
+      report += `Recipients: ${result.recipients} 👥\n`;
+      report += `Failed: ${result.failed || 0} ❌\n\n`;
+      
+      if (result.calculation) {
+        report += `Pool before: ${fmtSol(result.calculation.pool || 0)} SOL 💰\n`;
+        report += `Supply: ${result.calculation.supplyUi?.toFixed(0) || 'N/A'} tokens 🪙\n`;
+        report += `Eligible holders: ${result.calculation.eligibleCount || 0} ✅\n\n`;
+      }
+      
+      if (result.transactions && result.transactions.length > 0) {
+        const successful = result.transactions.filter(t => t.success);
+        const failed = result.transactions.filter(t => !t.success);
+        
+        if (successful.length > 0) {
+          report += `✅ Successful (${successful.length}):\n`;
+          successful.slice(0, 5).forEach(t => {
+            report += `- ${t.wallet.slice(0, 8)}...: ${fmtSol(t.amount)} SOL 💰\n`;
+          });
+          if (successful.length > 5) report += `... and ${successful.length - 5} more\n`;
+          report += `\n`;
+        }
+        
+        if (failed.length > 0) {
+          report += `❌ Failed (${failed.length}):\n`;
+          failed.slice(0, 3).forEach(t => {
+            report += `- ${t.wallet.slice(0, 8)}...: ${t.error?.slice(0, 50)}...\n`;
+          });
+        }
+      }
+    }
+  } else {
+    // Multi-token report
+    report += `📊 MANUAL PAYOUT REPORT\n\n`;
+    report += `Status: ${result.success ? '✅ SUCCESS' : '⚠️ PARTIAL'}\n`;
+    report += `Message: ${result.message}\n\n`;
+    
+    if (result.results && result.results.length > 0) {
+      report += `📈 Token Results:\n\n`;
+      
+      for (const tokenResult of result.results) {
+        report += `• ${tokenResult.tokenName} (${tokenResult.tokenSymbol || 'N/A'})\n`;
+        report += `  Paid: ${fmtSol(tokenResult.paid || 0)} SOL 💰\n`;
+        report += `  Recipients: ${tokenResult.recipients || 0} 👥\n`;
+        report += `  Status: ${tokenResult.success ? '✅' : '❌'} ${tokenResult.message || ''}\n\n`;
+      }
+    }
+    
+    report += `🏦 Total across all tokens:\n`;
+    report += `Total Paid: ${fmtSol(result.totalPaid || 0)} SOL 💰\n`;
+    report += `Total Recipients: ${result.totalRecipients || 0} 👥\n`;
+    report += `Successful Tokens: ${result.successfulTokens || 0}/${result.totalTokens || 0} ✅\n\n`;
+  }
+  
+  report += `⏰ Time: ${new Date().toLocaleString()}`;
+  return report;
+}
+
+/* =========================
+   PAYOUT VALIDATION
+========================= */
+async function validatePayoutWallet() {
+  try {
+    const balance = await connection.getBalance(payer.publicKey);
+    const balanceSol = balance / LAMPORTS_PER_SOL;
+    
+    // Get total potential payout
+    const activeTokens = db.prepare(`SELECT COUNT(*) as count FROM tokens WHERE status='ACTIVE'`).get();
+    const totalHolders = db.prepare(`SELECT COUNT(*) as count FROM holders`).get();
+    
+    // Estimate required balance (worst case)
+    const estimatedRequired = (totalHolders.count || 0) * MIN_PAYOUT_SOL + PAYOUT_WALLET_BUFFER_LAMPORTS / LAMPORTS_PER_SOL;
+    
+    return {
+      valid: balanceSol >= estimatedRequired,
+      currentBalance: balanceSol,
+      estimatedRequired,
+      activeTokens: activeTokens.count || 0,
+      totalHolders: totalHolders.count || 0,
+      message: balanceSol >= estimatedRequired 
+        ? `✅ Wallet balance sufficient: ${fmtSol(balanceSol)} SOL >= ${fmtSol(estimatedRequired)} SOL estimated required`
+        : `⚠️ Wallet balance low: ${fmtSol(balanceSol)} SOL < ${fmtSol(estimatedRequired)} SOL estimated required`
+    };
+  } catch (error) {
+    return {
+      valid: false,
+      error: error.message,
+      message: `❌ Failed to validate wallet: ${error.message}`
+    };
+  }
+}
+
+/* =========================
+   MODULE EXPORTS
+========================= */
+module.exports = {
+  // Initialization
+  initPayoutModule,
+  
+  // Core payout functions
+  calculatePayoutsForToken,
+  executePayoutsForToken,
+  manualPayoutAllTokens,
+  
+  // Helper functions
+  getPayoutEligibility,
+  getPayoutStats,
+  generatePayoutReport,
+  validatePayoutWallet,
+  
+  // Configuration getters
+  getConfig: () => ({
+    MIN_HOLDER_PCT,
+    MIN_HOLD_HOURS,
+    DAILY_PAYOUT_PCT,
+    MIN_PAYOUT_SOL,
+    MAX_PAYOUTS_PER_ROUND,
+    MAX_PAYOUT_RECIPIENTS,
+    TX_DELAY_MS,
+    PAYOUT_WALLET_BUFFER_LAMPORTS
+  }),
+  
+  // Utility
+  fmtSol,
+  monospace
+};
