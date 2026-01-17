@@ -1,0 +1,20 @@
+whitememe-bot/
+├── src/
+│   ├── index.js              # Hauptdatei
+│   ├── config.js             # Konfiguration
+│   ├── database.js           # DB Funktionen
+│   ├── solana.js             # Solana Funktionen
+│   ├── telegram.js           # Telegram Handler
+│   └── utils.js              # Hilfsfunktionen
+├── scripts/
+│   ├── deploy.js
+│   └── migrate.js
+├── docs/
+│   ├── API.md
+│   └── SETUP.md
+├── tests/
+├── .env.example
+├── .gitignore
+├── package.json
+├── README.md
+└── LICENSE
