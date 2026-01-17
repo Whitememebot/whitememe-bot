@@ -1,0 +1,7 @@
+-- Creator-isolated pools (key feature!)
+CREATE TABLE creator_token_pools (
+  creator_tg_id INTEGER NOT NULL,
+  token_ca TEXT NOT NULL,
+  sol_amount REAL NOT NULL,
+  PRIMARY KEY (creator_tg_id, token_ca)
+);
