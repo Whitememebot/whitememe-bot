@@ -1,0 +1,2 @@
+docker build -t whitememe-bot .
+docker run -d --env-file .env whitememe-bot
