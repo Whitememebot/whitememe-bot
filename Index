@@ -1,19 +1,4 @@
-/**
- * 🎭 WHITEMEME BOT — COMPLETELY FIXED VERSION
- * 
- * ✅ ALL FIXES APPLIED:
- * - FIXED: Admin Panel "Manage Tokens" now working
- * - FIXED: Creator Panel "Stats", "Report", "Holder Stats", "Edit Display" now working
- * - FIXED: All missing action handlers added
- * - FIXED: Proper callback routing for all buttons
- * - FIXED: Deactivate functionality
- * - FIXED: Edit display name/symbol flow
- * - FIXED: Admin token navigation with unique callback data
- * - FIXED: New post format with CA address
- * - ADDED: Debug logging for troubleshooting
- * - FIXED: Creator-isolated reward pools (CRITICAL FIX)
- * - FIXED: Database migration system with auto-fix
- */
+
 
 require('dotenv').config();
 
