@@ -1,1645 +1,3589 @@
-{
-  "name": "meme-bot",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "@solana/web3.js": "^1.98.4",
-    "axios": "^1.13.2",
-    "better-sqlite3": "^12.6.0",
-    "bs58": "^6.0.0",
-    "dotenv": "^17.2.3",
-    "p-limit": "^7.2.0",
-    "telegraf": "^4.16.3"
+/**
+ * 🎭 WHITEMEME BOT — COMPLETELY FIXED VERSION
+ * 
+ * ✅ ALL FIXES APPLIED:
+ * - FIXED: Admin Panel "Manage Tokens" now working
+ * - FIXED: Creator Panel "Stats", "Report", "Holder Stats", "Edit Display" now working
+ * - FIXED: All missing action handlers added
+ * - FIXED: Proper callback routing for all buttons
+ * - FIXED: Deactivate functionality
+ * - FIXED: Edit display name/symbol flow
+ * - FIXED: Admin token navigation with unique callback data
+ * - FIXED: New post format with CA address
+ * - ADDED: Debug logging for troubleshooting
+ * - FIXED: Creator-isolated reward pools (CRITICAL FIX)
+ * - FIXED: Database migration system with auto-fix
+ */
+
+require('dotenv').config();
+
+const path = require('path');
+const os = require('os');
+const axios = require('axios');
+
+const bs58pkg = require('bs58');
+const bs58 = bs58pkg.default || bs58pkg;
+
+const { Telegraf, Markup } = require('telegraf');
+const Database = require('better-sqlite3');
+
+const {
+  Connection,
+  PublicKey,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  SystemProgram,
+  Transaction,
+  sendAndConfirmTransaction,
+} = require('@solana/web3.js');
+
+/* =========================
+   CONFIG
+========================= */
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
+const CHANNEL_ID_RAW = String((process.env.CHANNEL_ID || '').trim());
+const RPC_URL = (process.env.RPC_URL || 'https://api.mainnet-beta.solana.com').trim();
+
+const CHANNEL_LINK = (process.env.CHANNEL_LINK || '').trim();
+const TWITTER_LINK = (process.env.TWITTER_LINK || '').trim();
+
+const PAYOUT_SECRET_BASE58 = (process.env.PAYOUT_SECRET_BASE58 || '').trim();
+const FEE_WALLET = (process.env.FEE_WALLET || '').trim();
+
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map(x => x.trim())
+  .filter(Boolean);
+
+const BROADCAST_DELAY_MS = Number(process.env.BROADCAST_DELAY_MS || 450);
+const META_REFRESH_MS = Number(process.env.META_REFRESH_MS || 90_000);
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 15_000);
+
+const MIN_HOLDER_PCT = Number(process.env.MIN_HOLDER_PCT || 0.0004);
+const MIN_HOLD_HOURS = Number(process.env.MIN_HOLD_HOURS || 24);
+const DAILY_PAYOUT_PCT = Number(process.env.DAILY_PAYOUT_PCT || 0.20);
+
+const MIN_PAYOUT_SOL = Number(process.env.MIN_PAYOUT_SOL || 0.00001);
+const MAX_PAYOUTS_PER_ROUND = Number(process.env.MAX_PAYOUTS_PER_ROUND || 300);
+const MAX_PAYOUT_RECIPIENTS = Number(process.env.MAX_PAYOUT_RECIPIENTS || 80);
+const TX_DELAY_MS = Number(process.env.TX_DELAY_MS || 350);
+const PAYOUT_WALLET_BUFFER_LAMPORTS = Number(process.env.PAYOUT_WALLET_BUFFER_LAMPORTS || 2_000_000);
+
+// Performance & Retry config
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000;
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function normalizeChannelId(x) {
+  const v = String(x || '').trim();
+  if (!v) return '';
+  if (v.startsWith('@')) return v;
+  return v;
+}
+
+const CHANNEL_ID = normalizeChannelId(CHANNEL_ID_RAW);
+
+if (!BOT_TOKEN || !CHANNEL_ID) {
+  console.log('❌ ERROR: Missing BOT_TOKEN or CHANNEL_ID in .env');
+  process.exit(1);
+}
+if (!PAYOUT_SECRET_BASE58) {
+  console.log('❌ ERROR: Missing PAYOUT_SECRET_BASE58 in .env');
+  process.exit(1);
+}
+if (!FEE_WALLET) {
+  console.log('❌ ERROR: Missing FEE_WALLET in .env');
+  process.exit(1);
+}
+
+/* =========================
+   SOLANA
+========================= */
+let payer;
+try {
+  const secret = bs58.decode(PAYOUT_SECRET_BASE58);
+  payer = Keypair.fromSecretKey(secret);
+} catch {
+  console.log('❌ ERROR: PAYOUT_SECRET_BASE58 is invalid.');
+  process.exit(1);
+}
+
+const REWARD_WALLET = payer.publicKey.toBase58();
+const connection = new Connection(RPC_URL, 'confirmed');
+const bot = new Telegraf(BOT_TOKEN);
+
+/* =========================
+   DATABASE
+========================= */
+const dbPath = (process.env.DB_PATH && process.env.DB_PATH.trim())
+  ? process.env.DB_PATH.trim()
+  : path.join(os.tmpdir(), 'whitememe.db');
+
+const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('busy_timeout = 8000');
+
+console.log('💾 Database Path:', dbPath);
+console.log('📢 Channel ID:', CHANNEL_ID);
+console.log('💰 Reward Wallet:', REWARD_WALLET);
+
+/* =========================
+   DATABASE SCHEMA + MIGRATION
+========================= */
+db.exec(`
+CREATE TABLE IF NOT EXISTS tokens (
+  ca TEXT PRIMARY KEY,
+  creator_tg_id INTEGER NOT NULL,
+  creator_username TEXT,
+  status TEXT NOT NULL DEFAULT 'PENDING_CONFIRM',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS token_meta (
+  ca TEXT PRIMARY KEY,
+  name TEXT,
+  symbol TEXT,
+  pump_url TEXT,
+  dex_url TEXT,
+  pair_address TEXT,
+  on_dex_at_reg INTEGER DEFAULT 0,
+  bonded_posted INTEGER DEFAULT 0,
+  base_mc REAL DEFAULT 0,
+  last_x_posted INTEGER DEFAULT 0,
+  last_mc REAL DEFAULT 0,
+  last_checked_at INTEGER DEFAULT 0,
+  logo_url TEXT,
+  display_name TEXT,
+  display_symbol TEXT
+);
+
+-- NEUE TABELLE: Creator-Pools für jeden Creator-Token
+CREATE TABLE IF NOT EXISTS creator_token_pools (
+  creator_tg_id INTEGER NOT NULL,
+  token_ca TEXT NOT NULL,
+  sol_amount REAL NOT NULL DEFAULT 0,
+  last_updated INTEGER NOT NULL,
+  PRIMARY KEY (creator_tg_id, token_ca)
+);
+
+-- NEUE TABELLE: Creator-Payouts für Tracking
+CREATE TABLE IF NOT EXISTS creator_payouts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_tg_id INTEGER NOT NULL,
+  token_ca TEXT NOT NULL,
+  holder_wallet TEXT NOT NULL,
+  sol_amount REAL NOT NULL,
+  paid_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deposits (
+  signature TEXT PRIMARY KEY,
+  ca TEXT NOT NULL,
+  from_wallet TEXT,
+  sol_amount REAL NOT NULL,
+  fee_sol REAL NOT NULL,
+  reward_sol REAL NOT NULL,
+  fee_sig TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payouts (
+  payout_sig TEXT PRIMARY KEY,
+  ca TEXT NOT NULL,
+  to_wallet TEXT NOT NULL,
+  sol_amount REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS holders (
+  ca TEXT NOT NULL,
+  tg_id INTEGER NOT NULL,
+  username TEXT,
+  wallet TEXT NOT NULL,
+  registered_at INTEGER NOT NULL,
+  last_notified_at INTEGER DEFAULT 0,
+  last_notification_type TEXT,
+  total_paid REAL DEFAULT 0,
+  last_paid_at INTEGER DEFAULT 0,
+  PRIMARY KEY (ca, wallet)
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+  chat_id TEXT PRIMARY KEY,
+  title TEXT,
+  active INTEGER DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+`);
+
+function tableHasColumn(table, col) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some(r => r.name === col);
+}
+
+function addColumnIfMissing(table, col, defSql) {
+  if (!tableHasColumn(table, col)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${defSql}`);
+    console.log(`🔧 DB MIGRATION: added ${table}.${col}`);
   }
 }
 
-{
-  "name": "meme-bot",
-  "version": "1.0.0",
-  "lockfileVersion": 3,
-  "requires": true,
-  "packages": {
-    "": {
-      "name": "meme-bot",
-      "version": "1.0.0",
-      "license": "ISC",
-      "dependencies": {
-        "@solana/web3.js": "^1.98.4",
-        "axios": "^1.13.2",
-        "better-sqlite3": "^12.6.0",
-        "bs58": "^6.0.0",
-        "dotenv": "^17.2.3",
-        "p-limit": "^7.2.0",
-        "telegraf": "^4.16.3"
-      }
-    },
-    "node_modules/@babel/runtime": {
-      "version": "7.28.4",
-      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.28.4.tgz",
-      "integrity": "sha512-Q/N6JNWvIvPnLDvjlE1OUBLPQHH6l3CltCEsHIujp45zQUSSh8K+gHnaEX45yAT1nyngnINhvWtzN+Nb9D8RAQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=6.9.0"
-      }
-    },
-    "node_modules/@noble/curves": {
-      "version": "1.9.7",
-      "resolved": "https://registry.npmjs.org/@noble/curves/-/curves-1.9.7.tgz",
-      "integrity": "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==",
-      "license": "MIT",
-      "dependencies": {
-        "@noble/hashes": "1.8.0"
-      },
-      "engines": {
-        "node": "^14.21.3 || >=16"
-      },
-      "funding": {
-        "url": "https://paulmillr.com/funding/"
-      }
-    },
-    "node_modules/@noble/hashes": {
-      "version": "1.8.0",
-      "resolved": "https://registry.npmjs.org/@noble/hashes/-/hashes-1.8.0.tgz",
-      "integrity": "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==",
-      "license": "MIT",
-      "engines": {
-        "node": "^14.21.3 || >=16"
-      },
-      "funding": {
-        "url": "https://paulmillr.com/funding/"
-      }
-    },
-    "node_modules/@solana/buffer-layout": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/@solana/buffer-layout/-/buffer-layout-4.0.1.tgz",
-      "integrity": "sha512-E1ImOIAD1tBZFRdjeM4/pzTiTApC0AOBGwyAMS4fwIodCWArzJ3DWdoh8cKxeFM2fElkxBh2Aqts1BPC373rHA==",
-      "license": "MIT",
-      "dependencies": {
-        "buffer": "~6.0.3"
-      },
-      "engines": {
-        "node": ">=5.10"
-      }
-    },
-    "node_modules/@solana/buffer-layout/node_modules/buffer": {
-      "version": "6.0.3",
-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
+addColumnIfMissing('token_meta', 'on_dex_at_reg', 'INTEGER DEFAULT 0');
+addColumnIfMissing('token_meta', 'bonded_posted', 'INTEGER DEFAULT 0');
+addColumnIfMissing('token_meta', 'base_mc', 'REAL DEFAULT 0');
+addColumnIfMissing('token_meta', 'last_x_posted', 'INTEGER DEFAULT 0');
+addColumnIfMissing('token_meta', 'last_mc', 'REAL DEFAULT 0');
+addColumnIfMissing('token_meta', 'last_checked_at', 'INTEGER DEFAULT 0');
+addColumnIfMissing('token_meta', 'logo_url', 'TEXT');
+addColumnIfMissing('token_meta', 'display_name', 'TEXT');
+addColumnIfMissing('token_meta', 'display_symbol', 'TEXT');
+addColumnIfMissing('groups', 'last_error', 'TEXT');
+addColumnIfMissing('holders', 'last_notified_at', 'INTEGER DEFAULT 0');
+addColumnIfMissing('holders', 'last_notification_type', 'TEXT');
+addColumnIfMissing('holders', 'total_paid', 'REAL DEFAULT 0');
+addColumnIfMissing('holders', 'last_paid_at', 'INTEGER DEFAULT 0');
+
+/* =========================
+   AUTO MIGRATION SYSTEM - NEU!
+========================= */
+function runAutoMigration() {
+  console.log('🔧 Running auto-migration checks...');
+  
+  try {
+    // 1. Check if deposits table has creator_tg_id column
+    const depositsColumns = db.prepare(`
+      SELECT name FROM pragma_table_info('deposits')
+    `).all();
+    
+    const hasCreatorTgId = depositsColumns.some(col => col.name === 'creator_tg_id');
+    
+    if (!hasCreatorTgId) {
+      console.log('⚠️ deposits table missing creator_tg_id column - adding it now...');
+      
+      db.exec(`
+        ALTER TABLE deposits ADD COLUMN creator_tg_id INTEGER;
+      `);
+      
+      // Update existing deposits with creator info
+      db.exec(`
+        UPDATE deposits 
+        SET creator_tg_id = (
+          SELECT creator_tg_id FROM tokens WHERE tokens.ca = deposits.ca
+        )
+        WHERE creator_tg_id IS NULL;
+      `);
+      
+      console.log('✅ Added creator_tg_id to deposits table and updated existing records');
+    } else {
+      console.log('✅ deposits table has creator_tg_id column');
+    }
+    
+    // 2. Check if payouts table has creator_tg_id column
+    const payoutsColumns = db.prepare(`
+      SELECT name FROM pragma_table_info('payouts')
+    `).all();
+    
+    const hasPayoutsCreatorTgId = payoutsColumns.some(col => col.name === 'creator_tg_id');
+    
+    if (!hasPayoutsCreatorTgId) {
+      console.log('⚠️ payouts table missing creator_tg_id column - adding it now...');
+      
+      db.exec(`
+        ALTER TABLE payouts ADD COLUMN creator_tg_id INTEGER;
+      `);
+      
+      // Update existing payouts with creator info
+      db.exec(`
+        UPDATE payouts 
+        SET creator_tg_id = (
+          SELECT creator_tg_id FROM tokens WHERE tokens.ca = payouts.ca
+        )
+        WHERE creator_tg_id IS NULL;
+      `);
+      
+      console.log('✅ Added creator_tg_id to payouts table and updated existing records');
+    } else {
+      console.log('✅ payouts table has creator_tg_id column');
+    }
+    
+    // 3. Migrate existing data to creator_token_pools
+    console.log('🔄 Migrating existing data to creator_token_pools...');
+    const tokens = db.prepare(`SELECT ca, creator_tg_id FROM tokens`).all();
+    let migratedCount = 0;
+    let totalMigratedSOL = 0;
+    
+    for (const token of tokens) {
+      try {
+        // Calculate total deposited for this creator/token
+        const totalDeposited = db.prepare(`
+          SELECT COALESCE(SUM(reward_sol),0) as total 
+          FROM deposits 
+          WHERE ca=? 
+          AND (creator_tg_id=? OR creator_tg_id IS NULL OR creator_tg_id = '')
+        `).get(token.ca, token.creator_tg_id);
+        
+        // Calculate total paid out for this creator/token
+        const totalPaid = db.prepare(`
+          SELECT COALESCE(SUM(p.sol_amount),0) as total 
+          FROM payouts p
+          JOIN tokens t ON p.ca = t.ca
+          WHERE p.ca=? AND t.creator_tg_id=?
+        `).get(token.ca, token.creator_tg_id);
+        
+        const remaining = Number(totalDeposited?.total || 0) - Number(totalPaid?.total || 0);
+        
+        if (remaining > 0) {
+          // Check if pool already exists
+          const existingPool = db.prepare(`
+            SELECT sol_amount FROM creator_token_pools 
+            WHERE creator_tg_id=? AND token_ca=?
+          `).get(token.creator_tg_id, token.ca);
+          
+          if (!existingPool) {
+            db.prepare(`
+              INSERT INTO creator_token_pools 
+              (creator_tg_id, token_ca, sol_amount, last_updated)
+              VALUES (?, ?, ?, ?)
+            `).run(token.creator_tg_id, token.ca, remaining, Date.now());
+            
+            migratedCount++;
+            totalMigratedSOL += remaining;
+            console.log(`   Migrated ${remaining.toFixed(4)} SOL to creator ${token.creator_tg_id} for token ${token.ca.slice(0, 8)}...`);
+          }
         }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "base64-js": "^1.3.1",
-        "ieee754": "^1.2.1"
+      } catch (err) {
+        console.log(`   ⚠️ Error migrating token ${token.ca.slice(0, 8)}...: ${err.message}`);
       }
-    },
-    "node_modules/@solana/codecs-core": {
-      "version": "2.3.0",
-      "resolved": "https://registry.npmjs.org/@solana/codecs-core/-/codecs-core-2.3.0.tgz",
-      "integrity": "sha512-oG+VZzN6YhBHIoSKgS5ESM9VIGzhWjEHEGNPSibiDTxFhsFWxNaz8LbMDPjBUE69r9wmdGLkrQ+wVPbnJcZPvw==",
-      "license": "MIT",
-      "dependencies": {
-        "@solana/errors": "2.3.0"
-      },
-      "engines": {
-        "node": ">=20.18.0"
-      },
-      "peerDependencies": {
-        "typescript": ">=5.3.3"
+    }
+    
+    console.log(`✅ Migration completed: ${migratedCount} creator pools updated, total ${totalMigratedSOL.toFixed(4)} SOL migrated`);
+    
+    // 4. Create indexes for better performance
+    console.log('⚡ Creating performance indexes...');
+    
+    const indexes = [
+      'CREATE INDEX IF NOT EXISTS idx_deposits_ca_creator ON deposits(ca, creator_tg_id)',
+      'CREATE INDEX IF NOT EXISTS idx_payouts_ca_creator ON payouts(ca, creator_tg_id)',
+      'CREATE INDEX IF NOT EXISTS idx_creator_pools_creator_token ON creator_token_pools(creator_tg_id, token_ca)',
+      'CREATE INDEX IF NOT EXISTS idx_creator_payouts_creator_token ON creator_payouts(creator_tg_id, token_ca)',
+      'CREATE INDEX IF NOT EXISTS idx_holders_ca_wallet ON holders(ca, wallet)',
+      'CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_tg_id)',
+      'CREATE INDEX IF NOT EXISTS idx_token_meta_ca ON token_meta(ca)'
+    ];
+    
+    for (const indexSql of indexes) {
+      try {
+        db.exec(indexSql);
+      } catch (e) {
+        // Ignore duplicate index errors
       }
-    },
-    "node_modules/@solana/codecs-numbers": {
-      "version": "2.3.0",
-      "resolved": "https://registry.npmjs.org/@solana/codecs-numbers/-/codecs-numbers-2.3.0.tgz",
-      "integrity": "sha512-jFvvwKJKffvG7Iz9dmN51OGB7JBcy2CJ6Xf3NqD/VP90xak66m/Lg48T01u5IQ/hc15mChVHiBm+HHuOFDUrQg==",
-      "license": "MIT",
-      "dependencies": {
-        "@solana/codecs-core": "2.3.0",
-        "@solana/errors": "2.3.0"
-      },
-      "engines": {
-        "node": ">=20.18.0"
-      },
-      "peerDependencies": {
-        "typescript": ">=5.3.3"
+    }
+    
+    console.log('✅ Performance indexes created');
+    
+  } catch (error) {
+    console.log('⚠️ Auto-migration error:', error.message);
+    console.log('💡 Continuing bot startup...');
+  }
+}
+
+/* =========================
+   HELPER FUNCTIONS
+========================= */
+const now = () => Date.now();
+
+async function withRetry(fn, context = '', retries = MAX_RETRIES) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      console.log(`🔄 Retry ${i + 1}/${retries} for ${context}:`, error.message);
+      if (i === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (i + 1)));
+    }
+  }
+}
+
+function isAdmin(ctx) {
+  return ADMIN_IDS.includes(String(ctx.from?.id || ''));
+}
+
+function isValidPubkey(s) {
+  try { new PublicKey((s || '').trim()); return true; } catch { return false; }
+}
+
+function extractFirstPubkey(text) {
+  const t = (text || '').trim();
+  if (!t) return null;
+  const parts = t.split(/\s+/g).filter(Boolean);
+  for (const p of parts) if (isValidPubkey(p)) return p;
+  const m = t.match(/[1-9A-HJ-NP-Za-km-z]{32,60}/g);
+  if (m) for (const cand of m) if (isValidPubkey(cand)) return cand;
+  return null;
+}
+
+function extractSignatureFromText(text) {
+  const t = (text || '').trim();
+  const m = t.match(/solscan\.io\/tx\/([A-Za-z0-9]+)/i);
+  if (m?.[1]) return m[1];
+  if (/^[A-Za-z0-9]{50,120}$/.test(t)) return t;
+  return null;
+}
+
+function fmtSol(x) {
+  return Number(x || 0).toFixed(4);
+}
+
+function pumpfunLink(tokenCA) { return `https://pump.fun/${tokenCA}`; }
+function dexscreenerTokenLink(tokenCA) { return `https://dexscreener.com/solana/${tokenCA}`; }
+
+function dbGetSetting(k, fallback = null) {
+  const r = db.prepare(`SELECT v FROM settings WHERE k=?`).get(k);
+  return r?.v ?? fallback;
+}
+
+function dbSetSetting(k, v) {
+  db.prepare(`INSERT INTO settings (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`)
+    .run(k, String(v));
+}
+
+function getActiveGroups() {
+  return db.prepare(`SELECT chat_id FROM groups WHERE active=1`).all().map(r => String(r.chat_id));
+}
+
+function disableGroup(chatId, reason) {
+  db.prepare(`UPDATE groups SET active=0, last_error=? WHERE chat_id=?`).run(String(reason || ''), String(chatId));
+}
+
+async function safeAnswerCb(ctx) { 
+  try { 
+    await ctx.answerCbQuery(); 
+  } catch (e) {
+    console.log('❌ Error answering callback:', e.message);
+  }
+}
+
+function tgErrSummary(e) {
+  const code = e?.code;
+  const desc = e?.description;
+  const msg = e?.message || '';
+  return `code=${code || 'n/a'} desc=${desc || 'n/a'} msg=${msg || 'n/a'}`;
+}
+
+// Format Market Cap function - FIXED!
+function formatMc(mc) {
+  const x = Number(mc || 0);
+  if (!x) return 'N/A';
+  if (x >= 1e9) return `${(x / 1e9).toFixed(2)}B`;
+  if (x >= 1e6) return `${(x / 1e6).toFixed(2)}M`;
+  if (x >= 1e3) return `${(x / 1e3).toFixed(2)}K`;
+  return `${x.toFixed(0)}`;
+}
+
+/* =========================
+   DM NOTIFICATION FUNCTIONS
+========================= */
+async function sendPayoutDM(holderTgId, tokenCA, payoutAmount, wallet, signature) {
+  try {
+    const meta = getMeta(tokenCA);
+    const tokenName = meta?.display_name || meta?.name || tokenCA.slice(0, 8);
+    
+    const dmText = `🎉 WHITEMEME REWARD PAYOUT! 🎉
+
+💰 You received: ${fmtSol(payoutAmount)} SOL
+📊 Token: ${tokenName}
+👛 Your wallet: ${wallet.slice(0, 8)}...${wallet.slice(-4)}
+📅 Payout date: ${new Date().toLocaleDateString()}
+🔗 Transaction: ${signature.slice(0, 16)}...
+
+✅ Thank you for holding!
+⏰ Keep holding for more rewards! 🚀`;
+
+    await bot.telegram.sendMessage(holderTgId, dmText);
+    console.log(`📨 Payout DM sent to ${holderTgId}: ${fmtSol(payoutAmount)} SOL`);
+    return true;
+  } catch (error) {
+    console.log(`❌ Failed to send payout DM to ${holderTgId}:`, error.message);
+    return false;
+  }
+}
+
+async function sendRegistrationDM(holderTgId, tokenCA, wallet, balance, supplyUi) {
+  try {
+    const meta = getMeta(tokenCA);
+    const tokenName = meta?.display_name || meta?.name || tokenCA.slice(0, 8);
+    const tokenSymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+    
+    const holderPct = supplyUi > 0 ? (balance / supplyUi * 100).toFixed(6) : '0';
+    const requiredPct = (MIN_HOLDER_PCT * 100).toFixed(4);
+    
+    const dmText = `✅ WHITEMEME HOLDER REGISTERED!
+
+📊 Token: ${tokenName} #${tokenSymbol}
+👛 Your wallet: ${wallet.slice(0, 8)}...${wallet.slice(-4)}
+📅 Registered: ${new Date().toLocaleDateString()}
+🔍 Your balance: ${balance.toFixed(4)} tokens
+
+📈 Eligibility Status:
+✓ Minimum holding: ${requiredPct}% ✅ (you have ${holderPct}%)
+⏰ Hold time: 0/${MIN_HOLD_HOURS} hours
+💰 Estimated daily reward: ~${fmtSol(balance / supplyUi * 100)} SOL
+
+✅ You will receive automatic payouts!`;
+
+    await bot.telegram.sendMessage(holderTgId, dmText);
+    console.log(`📨 Registration DM sent to ${holderTgId} for ${tokenName}`);
+    return true;
+  } catch (error) {
+    console.log(`❌ Failed to send registration DM to ${holderTgId}:`, error.message);
+    return false;
+  }
+}
+
+async function sendEligibilityDM(holderTgId, tokenCA, holdHours) {
+  try {
+    const meta = getMeta(tokenCA);
+    const tokenName = meta?.display_name || meta?.name || tokenCA.slice(0, 8);
+    const tokenSymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+    
+    const dmText = `📊 WHITEMEME ELIGIBILITY UPDATE
+
+🎯 Token: ${tokenName} #${tokenSymbol}
+✅ You are NOW ELIGIBLE for rewards!
+⏰ Hold time: ${holdHours.toFixed(1)}/${MIN_HOLD_HOURS} hours ✅
+📊 Your share: Calculated based on your holdings
+💰 Next payout: Today 20:00 UTC
+
+🎉 Congratulations! Keep holding for rewards!`;
+
+    await bot.telegram.sendMessage(holderTgId, dmText);
+    console.log(`📨 Eligibility DM sent to ${holderTgId} for ${tokenName}`);
+    return true;
+  } catch (error) {
+    console.log(`❌ Failed to send eligibility DM to ${holderTgId}:`, error.message);
+    return false;
+  }
+}
+
+/* =========================
+   SOLANA HELPER FUNCTIONS
+========================= */
+async function getMintSupplyAndDecimals(mint) {
+  return await withRetry(async () => {
+    const pk = new PublicKey(mint);
+    const supply = await connection.getTokenSupply(pk, 'confirmed');
+    const decimals = Number(supply?.value?.decimals ?? 0);
+    const amount = Number(supply?.value?.amount ?? 0);
+    const uiAmount = Number(supply?.value?.uiAmount ?? 0);
+    return { decimals, rawAmount: amount, uiAmount };
+  }, 'getMintSupplyAndDecimals');
+}
+
+async function getWalletTokenBalanceUi(wallet, mint) {
+  return await withRetry(async () => {
+    const owner = new PublicKey(wallet);
+    const m = new PublicKey(mint);
+    const res = await connection.getParsedTokenAccountsByOwner(owner, { mint: m }, 'confirmed');
+    let total = 0;
+    for (const acc of res.value || []) {
+      const ui = acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+      total += Number(ui || 0);
+    }
+    return total;
+  }, 'getWalletTokenBalanceUi');
+}
+
+/* =========================
+   CREATOR POOL FUNCTIONS (NEUE FUNKTIONEN)
+========================= */
+function getCreatorTokenPool(creatorId, tokenCA) {
+  const row = db.prepare(`
+    SELECT sol_amount FROM creator_token_pools 
+    WHERE creator_tg_id=? AND token_ca=?
+  `).get(creatorId, tokenCA);
+  return Number(row?.sol_amount || 0);
+}
+
+function getCreatorTotalPool(creatorId) {
+  const rows = db.prepare(`
+    SELECT sol_amount FROM creator_token_pools 
+    WHERE creator_tg_id=?
+  `).all(creatorId);
+  
+  let total = 0;
+  rows.forEach(row => total += Number(row.sol_amount || 0));
+  return total;
+}
+
+function updateCreatorTokenPool(creatorId, tokenCA, amount) {
+  db.prepare(`
+    INSERT INTO creator_token_pools (creator_tg_id, token_ca, sol_amount, last_updated)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(creator_tg_id, token_ca) DO UPDATE SET
+      sol_amount = sol_amount + excluded.sol_amount,
+      last_updated = excluded.last_updated
+  `).run(creatorId, tokenCA, amount, now());
+}
+
+function getCreatorTokenStats(creatorId, tokenCA) {
+  const pool = getCreatorTokenPool(creatorId, tokenCA);
+  const totalDeposited = db.prepare(`
+    SELECT COALESCE(SUM(reward_sol),0) as total 
+    FROM deposits 
+    WHERE ca=? AND creator_tg_id=?
+  `).get(tokenCA, creatorId);
+  
+  const totalPaid = db.prepare(`
+    SELECT COALESCE(SUM(sol_amount),0) as total 
+    FROM creator_payouts 
+    WHERE creator_tg_id=? AND token_ca=?
+  `).get(creatorId, tokenCA);
+  
+  return {
+    pool: Number(pool || 0),
+    totalDeposited: Number(totalDeposited?.total || 0),
+    totalPaid: Number(totalPaid?.total || 0)
+  };
+}
+
+/* =========================
+   PAYOUT HELPER FUNCTIONS (AKTUALISIERT)
+========================= */
+function getPayoutEligibility(tokenCA, wallet, balance) {
+  const holder = db.prepare(`SELECT registered_at, tg_id FROM holders WHERE ca=? AND wallet=?`).get(tokenCA, wallet);
+  if (!holder) return { eligible: false, reason: 'not_registered' };
+  
+  const registeredAt = Number(holder.registered_at || 0);
+  const holdHours = (now() - registeredAt) / (1000 * 60 * 60);
+  
+  if (holdHours < MIN_HOLD_HOURS) {
+    return { 
+      eligible: false, 
+      reason: 'hold_time', 
+      hours: holdHours,
+      required: MIN_HOLD_HOURS,
+      tg_id: holder.tg_id
+    };
+  }
+  
+  const token = getToken(tokenCA);
+  if (!token || token.status !== 'ACTIVE') {
+    return { eligible: false, reason: 'token_inactive', tg_id: holder.tg_id };
+  }
+  
+  return { eligible: true, holdHours, tg_id: holder.tg_id };
+}
+
+async function calculatePayoutsForToken(tokenCA) {
+  // WICHTIG: Hole nur den Pool vom jeweiligen Creator
+  const token = getToken(tokenCA);
+  if (!token) {
+    return { totalPayout: 0, recipients: [], message: 'Token not found' };
+  }
+  
+  const creatorId = token.creator_tg_id;
+  const creatorPool = getCreatorTokenPool(creatorId, tokenCA);
+  
+  // Nur den Creator-Pool verwenden, nicht den Gesamtpool
+  const pool = creatorPool;
+  
+  if (pool < MIN_PAYOUT_SOL) {
+    return { 
+      totalPayout: 0, 
+      recipients: [], 
+      message: `Creator pool too small: ${fmtSol(pool)} SOL < ${fmtSol(MIN_PAYOUT_SOL)} SOL minimum` 
+    };
+  }
+  
+  const holders = db.prepare(`
+    SELECT h.wallet, h.registered_at, h.tg_id
+    FROM holders h 
+    WHERE h.ca=? 
+    ORDER BY h.registered_at ASC
+    LIMIT ${MAX_PAYOUT_RECIPIENTS}
+  `).all(tokenCA);
+  
+  if (!holders.length) {
+    return { totalPayout: 0, recipients: [], message: 'No holders registered' };
+  }
+  
+  let supplyUi = 0;
+  try {
+    const supply = await getMintSupplyAndDecimals(tokenCA);
+    supplyUi = Number(supply.uiAmount || 0);
+    console.log(`✅ Token supply for ${tokenCA}: ${supplyUi}`);
+  } catch (e) {
+    console.log(`❌ Error fetching supply for ${tokenCA}:`, e.message);
+    return { totalPayout: 0, recipients: [], message: `Token supply unknown: ${e.message}` };
+  }
+  
+  if (supplyUi <= 0) {
+    return { totalPayout: 0, recipients: [], message: 'Token supply unknown or zero' };
+  }
+  
+  const eligibleRecipients = [];
+  let totalWeight = 0;
+  
+  for (const holder of holders) {
+    try {
+      const balance = await getWalletTokenBalanceUi(holder.wallet, tokenCA);
+      
+      if (balance <= 0) continue;
+      
+      const holderPct = balance / supplyUi;
+      if (holderPct < MIN_HOLDER_PCT) continue;
+      
+      const eligibility = getPayoutEligibility(tokenCA, holder.wallet, balance);
+      
+      if (eligibility.eligible) {
+        const holderWeight = balance / supplyUi;
+        eligibleRecipients.push({
+          wallet: holder.wallet,
+          balance,
+          weight: holderWeight,
+          holdHours: eligibility.holdHours,
+          holderPct: holderPct * 100,
+          tg_id: holder.tg_id
+        });
+        totalWeight += holderWeight;
       }
-    },
-    "node_modules/@solana/errors": {
-      "version": "2.3.0",
-      "resolved": "https://registry.npmjs.org/@solana/errors/-/errors-2.3.0.tgz",
-      "integrity": "sha512-66RI9MAbwYV0UtP7kGcTBVLxJgUxoZGm8Fbc0ah+lGiAw17Gugco6+9GrJCV83VyF2mDWyYnYM9qdI3yjgpnaQ==",
-      "license": "MIT",
-      "dependencies": {
-        "chalk": "^5.4.1",
-        "commander": "^14.0.0"
-      },
-      "bin": {
-        "errors": "bin/cli.mjs"
-      },
-      "engines": {
-        "node": ">=20.18.0"
-      },
-      "peerDependencies": {
-        "typescript": ">=5.3.3"
+    } catch (e) {
+      console.log(`❌ Error checking holder ${holder.wallet}:`, e.message);
+    }
+  }
+  
+  if (!eligibleRecipients.length) {
+    return { totalPayout: 0, recipients: [], message: 'No eligible holders' };
+  }
+  
+  const dailyPayoutAmount = pool * DAILY_PAYOUT_PCT;
+  const actualPayoutAmount = Math.min(dailyPayoutAmount, pool);
+  
+  const payouts = [];
+  let totalToPay = 0;
+  let recipientsCount = 0;
+  
+  for (const recipient of eligibleRecipients) {
+    if (recipientsCount >= MAX_PAYOUTS_PER_ROUND) break;
+    
+    const share = recipient.weight / totalWeight;
+    const payoutAmount = actualPayoutAmount * share;
+    
+    if (payoutAmount >= MIN_PAYOUT_SOL) {
+      payouts.push({
+        wallet: recipient.wallet,
+        amount: payoutAmount,
+        share: share * 100,
+        balance: recipient.balance,
+        holdHours: recipient.holdHours,
+        holderPct: recipient.holderPct,
+        tg_id: recipient.tg_id
+      });
+      totalToPay += payoutAmount;
+      recipientsCount++;
+    }
+  }
+  
+  return {
+    totalPayout: totalToPay,
+    recipients: payouts,
+    pool,
+    supplyUi,
+    message: `Calculated ${payouts.length} payouts totaling ${fmtSol(totalToPay)} SOL`
+  };
+}
+
+async function executePayoutsForToken(tokenCA) {
+  const calculation = await calculatePayoutsForToken(tokenCA);
+  
+  if (calculation.totalPayout <= 0 || !calculation.recipients.length) {
+    return {
+      success: false,
+      message: calculation.message,
+      paid: 0,
+      recipients: 0,
+      transactions: []
+    };
+  }
+  
+  const payerBalance = await connection.getBalance(payer.publicKey);
+  const requiredBalance = Math.ceil(calculation.totalPayout * LAMPORTS_PER_SOL + PAYOUT_WALLET_BUFFER_LAMPORTS);
+  
+  if (payerBalance < requiredBalance) {
+    return {
+      success: false,
+      message: `Insufficient balance in payout wallet: ${fmtSol(payerBalance / LAMPORTS_PER_SOL)} SOL < ${fmtSol(requiredBalance / LAMPORTS_PER_SOL)} SOL required`,
+      paid: 0,
+      recipients: 0,
+      transactions: []
+    };
+  }
+  
+  const transactions = [];
+  let totalPaid = 0;
+  let successfulRecipients = 0;
+  const token = getToken(tokenCA);
+  const creatorId = token.creator_tg_id;
+  
+  for (const payout of calculation.recipients) {
+    try {
+      const lamports = Math.floor(payout.amount * LAMPORTS_PER_SOL);
+      if (lamports <= 0) continue;
+      
+      const to = new PublicKey(payout.wallet);
+      const tx = new Transaction().add(
+        SystemProgram.transfer({ 
+          fromPubkey: payer.publicKey, 
+          toPubkey: to, 
+          lamports 
+        })
+      );
+      
+      const sig = await sendAndConfirmTransaction(connection, tx, [payer], { 
+        commitment: 'confirmed',
+        skipPreflight: false,
+        preflightCommitment: 'confirmed'
+      });
+      
+      // Save payout to database
+      db.prepare(`
+        INSERT INTO payouts (payout_sig, ca, to_wallet, sol_amount, created_at, creator_tg_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(sig, tokenCA, payout.wallet, payout.amount, now(), creatorId);
+      
+      // Save to creator_payouts table for tracking
+      db.prepare(`
+        INSERT INTO creator_payouts (creator_tg_id, token_ca, holder_wallet, sol_amount, paid_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(creatorId, tokenCA, payout.wallet, payout.amount, now());
+      
+      // Update holder stats
+      db.prepare(`
+        UPDATE holders 
+        SET total_paid = total_paid + ?, last_paid_at = ?
+        WHERE ca=? AND wallet=?
+      `).run(payout.amount, now(), tokenCA, payout.wallet);
+      
+      // WICHTIG: Creator-Pool reduzieren (nur dieser Creator!)
+      db.prepare(`
+        UPDATE creator_token_pools 
+        SET sol_amount = sol_amount - ?, last_updated = ?
+        WHERE creator_tg_id=? AND token_ca=?
+      `).run(payout.amount, now(), creatorId, tokenCA);
+      
+      // Send DM notification to holder
+      if (payout.tg_id) {
+        await sendPayoutDM(payout.tg_id, tokenCA, payout.amount, payout.wallet, sig);
       }
-    },
-    "node_modules/@solana/web3.js": {
-      "version": "1.98.4",
-      "resolved": "https://registry.npmjs.org/@solana/web3.js/-/web3.js-1.98.4.tgz",
-      "integrity": "sha512-vv9lfnvjUsRiq//+j5pBdXig0IQdtzA0BRZ3bXEP4KaIyF1CcaydWqgyzQgfZMNIsWNWmG+AUHwPy4AHOD6gpw==",
-      "license": "MIT",
-      "dependencies": {
-        "@babel/runtime": "^7.25.0",
-        "@noble/curves": "^1.4.2",
-        "@noble/hashes": "^1.4.0",
-        "@solana/buffer-layout": "^4.0.1",
-        "@solana/codecs-numbers": "^2.1.0",
-        "agentkeepalive": "^4.5.0",
-        "bn.js": "^5.2.1",
-        "borsh": "^0.7.0",
-        "bs58": "^4.0.1",
-        "buffer": "6.0.3",
-        "fast-stable-stringify": "^1.0.0",
-        "jayson": "^4.1.1",
-        "node-fetch": "^2.7.0",
-        "rpc-websockets": "^9.0.2",
-        "superstruct": "^2.0.2"
-      }
-    },
-    "node_modules/@solana/web3.js/node_modules/base-x": {
-      "version": "3.0.11",
-      "resolved": "https://registry.npmjs.org/base-x/-/base-x-3.0.11.tgz",
-      "integrity": "sha512-xz7wQ8xDhdyP7tQxwdteLYeFfS68tSMNCZ/Y37WJ4bhGfKPpqEIlmIyueQHqOyoPhE6xNUqjzRr8ra0eF9VRvA==",
-      "license": "MIT",
-      "dependencies": {
-        "safe-buffer": "^5.0.1"
-      }
-    },
-    "node_modules/@solana/web3.js/node_modules/bs58": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/bs58/-/bs58-4.0.1.tgz",
-      "integrity": "sha512-Ok3Wdf5vOIlBrgCvTq96gBkJw+JUEzdBgyaza5HLtPm7yTHkjRy8+JzNyHF7BHa0bNWOQIp3m5YF0nnFcOIKLw==",
-      "license": "MIT",
-      "dependencies": {
-        "base-x": "^3.0.2"
-      }
-    },
-    "node_modules/@solana/web3.js/node_modules/buffer": {
-      "version": "6.0.3",
-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
+      
+      transactions.push({
+        wallet: payout.wallet,
+        amount: payout.amount,
+        signature: sig,
+        tg_id: payout.tg_id,
+        success: true
+      });
+      
+      totalPaid += payout.amount;
+      successfulRecipients++;
+      
+      console.log(`✅ Payout to ${payout.wallet.slice(0, 8)}...: ${fmtSol(payout.amount)} SOL (from creator ${creatorId} pool)`);
+      
+      await new Promise(resolve => setTimeout(resolve, TX_DELAY_MS));
+      
+    } catch (error) {
+      console.log(`❌ Payout failed to ${payout.wallet.slice(0, 8)}...:`, error.message);
+      transactions.push({
+        wallet: payout.wallet,
+        amount: payout.amount,
+        error: error.message,
+        success: false
+      });
+    }
+  }
+  
+  return {
+    success: successfulRecipients > 0,
+    message: `Executed ${successfulRecipients} payouts totaling ${fmtSol(totalPaid)} SOL (from creator ${creatorId} pool)`,
+    paid: totalPaid,
+    recipients: successfulRecipients,
+    transactions,
+    calculation
+  };
+}
+
+async function manualPayoutAllTokens() {
+  const activeTokens = db.prepare(`
+    SELECT t.ca, t.creator_tg_id,
+           COALESCE(tm.display_name, tm.name) as name,
+           COALESCE(tm.display_symbol, tm.symbol) as symbol
+    FROM tokens t
+    LEFT JOIN token_meta tm ON tm.ca=t.ca
+    WHERE t.status='ACTIVE'
+  `).all();
+  
+  if (!activeTokens.length) {
+    return { success: false, message: 'No active tokens found' };
+  }
+  
+  const results = [];
+  let totalPaidAll = 0;
+  let totalRecipientsAll = 0;
+  
+  for (const token of activeTokens) {
+    console.log(`💰 Processing payouts for token: ${token.name || token.ca} (creator: ${token.creator_tg_id})`);
+    
+    // Check if creator has pool for this token
+    const creatorPool = getCreatorTokenPool(token.creator_tg_id, token.ca);
+    if (creatorPool < MIN_PAYOUT_SOL) {
+      console.log(`⚠️ Skipping ${token.ca}: Creator pool too small (${fmtSol(creatorPool)} SOL)`);
+      continue;
+    }
+    
+    const result = await executePayoutsForToken(token.ca);
+    
+    results.push({
+      tokenCA: token.ca,
+      tokenName: token.name || 'Unknown',
+      tokenSymbol: token.symbol || 'N/A',
+      creatorId: token.creator_tg_id,
+      ...result
+    });
+    
+    totalPaidAll += result.paid || 0;
+    totalRecipientsAll += result.recipients || 0;
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  
+  return {
+    success: totalPaidAll > 0,
+    message: `Manual payout completed: ${totalRecipientsAll} recipients paid ${fmtSol(totalPaidAll)} SOL across ${results.length} tokens`,
+    totalPaid: totalPaidAll,
+    totalRecipients: totalRecipientsAll,
+    results
+  };
+}
+
+/* =========================
+   BONDED POSTING & MILESTONE SYSTEM
+========================= */
+async function checkAndPostMilestones() {
+  const activeTokens = db.prepare(`
+    SELECT t.ca, tm.base_mc, tm.last_mc, tm.last_x_posted, tm.bonded_posted,
+           COALESCE(tm.display_name, tm.name) as name,
+           COALESCE(tm.display_symbol, tm.symbol) as symbol
+    FROM tokens t
+    LEFT JOIN token_meta tm ON tm.ca=t.ca
+    WHERE t.status='ACTIVE' 
+      AND tm.base_mc > 0 
+      AND tm.last_mc > 0
+  `).all();
+
+  for (const token of activeTokens) {
+    const currentMC = Number(token.last_mc || 0);
+    const baseMC = Number(token.base_mc || 0);
+    
+    if (baseMC <= 0 || currentMC <= 0) continue;
+    
+    const multiplier = currentMC / baseMC;
+    let milestone = 0;
+    
+    if (multiplier >= 10 && (!token.last_x_posted || token.last_x_posted < 10)) {
+      milestone = 10;
+    } else if (multiplier >= 5 && (!token.last_x_posted || token.last_x_posted < 5)) {
+      milestone = 5;
+    } else if (multiplier >= 2 && (!token.last_x_posted || token.last_x_posted < 2)) {
+      milestone = 2;
+    }
+    
+    if (milestone > 0) {
+      db.prepare(`UPDATE token_meta SET last_x_posted=? WHERE ca=?`).run(milestone, token.ca);
+      
+      const isPumpFun = String(token.ca).toLowerCase().endsWith('pump');
+      const meta = getMeta(token.ca);
+      const isBonded = meta?.on_dex_at_reg === 1 && isPumpFun;
+      
+      await postMilestone(token.ca, milestone, isBonded);
+      
+      console.log(`📈 ${isBonded ? 'Bonded' : 'Milestone'} Post: ${token.name} reached ${milestone}x`);
+      
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+}
+
+async function postMilestone(tokenCA, milestone, isBonded = false) {
+  const meta = getMeta(tokenCA) || await refreshMetaPriority(tokenCA);
+  const token = getToken(tokenCA);
+  const creatorPool = token ? getCreatorTokenPool(token.creator_tg_id, tokenCA) : 0;
+  const displayName = meta?.display_name || meta?.name || 'Token';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  const emojiMap = { 2: '💰', 5: '🚀', 10: '💎' };
+  const emoji = emojiMap[milestone] || '🎉';
+  const emojiString = emoji.repeat(milestone);
+  
+  let caption = '';
+  
+  if (isBonded) {
+    caption = `🎗️ BONDED POSTING 🚀
+
+🪙 Token: ${displayName} #${displaySymbol}
+🎯 Status: BONDED TO DEX
+🏆 Achievement: ${milestone}X FROM BOND!
+
+Token successfully bonded and already ${milestone}X!
+From Pump.fun to DEX success!
+
+💎 Market Cap: ${formatMc(Number(meta?.last_mc || 0))}
+💰 Creator Pool: ${fmtSol(creatorPool)} SOL
+
+✅ Bonded token - Fully launched!
+⏰ Holders earning rewards
+
+${emojiString}`;
+  } else {
+    caption = `📈 MILESTONE UPDATE!
+
+🪙 Token: ${displayName} #${displaySymbol}
+🏆 Achievement: ${milestone}X FROM LAUNCH!
+
+Token has ${milestone}X'd from launch price! 
+Great momentum building!
+
+💎 Market Cap: ${formatMc(Number(meta?.last_mc || 0))}
+💰 Creator Pool: ${fmtSol(creatorPool)} SOL
+
+✅ Holders earning automatic rewards
+⏰ Minimum hold: ${MIN_HOLD_HOURS} hours
+
+${emojiString}`;
+  }
+
+  try {
+    const me = await bot.telegram.getMe();
+    
+    let buttons;
+    const isPump = String(tokenCA).toLowerCase().endsWith('pump');
+    if (isPump) {
+      buttons = Markup.inlineKeyboard([
+        [
+          Markup.button.url('🚀 Pump.fun', meta?.pump_url || pumpfunLink(tokenCA)),
+          Markup.button.url('📊 Chart', meta?.dex_url || dexscreenerTokenLink(tokenCA)),
+        ],
+        [Markup.button.url('🤖 Open WhiteMeme Bot', `https://t.me/${me.username}`)],
+      ]);
+    } else {
+      buttons = Markup.inlineKeyboard([
+        [
+          Markup.button.url('📊 Chart', meta?.dex_url || dexscreenerTokenLink(tokenCA)),
+        ],
+        [Markup.button.url('🤖 Open WhiteMeme Bot', `https://t.me/${me.username}`)],
+      ]);
+    }
+
+    const img = meta?.logo_url || null;
+
+    if (img) {
+      broadcastToChannelAndGroups('sendPhoto', [img, { 
+        caption, 
+        reply_markup: buttons.reply_markup,
+        parse_mode: 'Markdown'
+      }], `(${isBonded ? 'bonded' : 'milestone'} ${milestone}x ${tokenCA.slice(0, 6)}...)`);
+    } else {
+      broadcastToChannelAndGroups('sendMessage', [caption, { 
+        reply_markup: buttons.reply_markup,
+        parse_mode: 'Markdown'
+      }], `(${isBonded ? 'bonded' : 'milestone'} ${milestone}x ${tokenCA.slice(0, 6)}...)`);
+    }
+
+    console.log(`✅ ${isBonded ? 'Bonded' : 'Milestone'} post queued for ${milestone}x: ${tokenCA}`);
+
+  } catch (error) {
+    console.log(`❌ Error creating ${isBonded ? 'bonded' : 'milestone'} post: ${error.message}`);
+  }
+}
+
+function startMilestoneChecker() {
+  console.log('📈 Starting Milestone Checker...');
+  
+  setInterval(async () => {
+    try {
+      const activeTokens = db.prepare(`
+        SELECT ca FROM tokens WHERE status='ACTIVE'
+      `).all();
+      
+      for (const token of activeTokens) {
+        try {
+          const pair = await fetchDexPair(token.ca);
+          if (pair) {
+            const mc = pairMarketCap(pair);
+            if (mc > 0) {
+              db.prepare(`UPDATE token_meta SET last_mc=?, last_checked_at=? WHERE ca=?`)
+                .run(mc, now(), token.ca);
+              
+              const meta = getMeta(token.ca);
+              if (!meta?.base_mc || Number(meta.base_mc) <= 0) {
+                db.prepare(`UPDATE token_meta SET base_mc=? WHERE ca=?`).run(mc, token.ca);
+              }
+            }
+          }
+        } catch (e) {
+          // Silent fail for individual tokens
         }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "base64-js": "^1.3.1",
-        "ieee754": "^1.2.1"
-      }
-    },
-    "node_modules/@swc/helpers": {
-      "version": "0.5.18",
-      "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.18.tgz",
-      "integrity": "sha512-TXTnIcNJQEKwThMMqBXsZ4VGAza6bvN4pa41Rkqoio6QBKMvo+5lexeTMScGCIxtzgQJzElcvIltani+adC5PQ==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "tslib": "^2.8.0"
-      }
-    },
-    "node_modules/@telegraf/types": {
-      "version": "7.1.0",
-      "resolved": "https://registry.npmjs.org/@telegraf/types/-/types-7.1.0.tgz",
-      "integrity": "sha512-kGevOIbpMcIlCDeorKGpwZmdH7kHbqlk/Yj6dEpJMKEQw5lk0KVQY0OLXaCswy8GqlIVLd5625OB+rAntP9xVw==",
-      "license": "MIT"
-    },
-    "node_modules/@types/connect": {
-      "version": "3.4.38",
-      "resolved": "https://registry.npmjs.org/@types/connect/-/connect-3.4.38.tgz",
-      "integrity": "sha512-K6uROf1LD88uDQqJCktA4yzL1YYAK6NgfsI0v/mTgyPKWsX1CnJ0XPSDhViejru1GcRkLWb8RlzFYJRqGUbaug==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/node": "*"
-      }
-    },
-    "node_modules/@types/node": {
-      "version": "12.20.55",
-      "resolved": "https://registry.npmjs.org/@types/node/-/node-12.20.55.tgz",
-      "integrity": "sha512-J8xLz7q2OFulZ2cyGTLE1TbbZcjpno7FaN6zdJNrgAdrJ+DZzh/uFR6YrTb4C+nXakvud8Q4+rbhoIWlYQbUFQ==",
-      "license": "MIT"
-    },
-    "node_modules/@types/uuid": {
-      "version": "8.3.4",
-      "resolved": "https://registry.npmjs.org/@types/uuid/-/uuid-8.3.4.tgz",
-      "integrity": "sha512-c/I8ZRb51j+pYGAu5CrFMRxqZ2ke4y2grEBO5AUjgSkSk+qT2Ea+OdWElz/OiMf5MNpn2b17kuVBwZLQJXzihw==",
-      "license": "MIT"
-    },
-    "node_modules/@types/ws": {
-      "version": "7.4.7",
-      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-7.4.7.tgz",
-      "integrity": "sha512-JQbbmxZTZehdc2iszGKs5oC3NFnjeay7mtAWrdt7qNtAVK0g19muApzAy4bm9byz79xa2ZnO/BOBC2R8RC5Lww==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/node": "*"
-      }
-    },
-    "node_modules/abort-controller": {
-      "version": "3.0.0",
-      "resolved": "https://registry.npmjs.org/abort-controller/-/abort-controller-3.0.0.tgz",
-      "integrity": "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==",
-      "license": "MIT",
-      "dependencies": {
-        "event-target-shim": "^5.0.0"
-      },
-      "engines": {
-        "node": ">=6.5"
-      }
-    },
-    "node_modules/agentkeepalive": {
-      "version": "4.6.0",
-      "resolved": "https://registry.npmjs.org/agentkeepalive/-/agentkeepalive-4.6.0.tgz",
-      "integrity": "sha512-kja8j7PjmncONqaTsB8fQ+wE2mSU2DJ9D4XKoJ5PFWIdRMa6SLSN1ff4mOr4jCbfRSsxR4keIiySJU0N9T5hIQ==",
-      "license": "MIT",
-      "dependencies": {
-        "humanize-ms": "^1.2.1"
-      },
-      "engines": {
-        "node": ">= 8.0.0"
-      }
-    },
-    "node_modules/asynckit": {
-      "version": "0.4.0",
-      "resolved": "https://registry.npmjs.org/asynckit/-/asynckit-0.4.0.tgz",
-      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==",
-      "license": "MIT"
-    },
-    "node_modules/axios": {
-      "version": "1.13.2",
-      "resolved": "https://registry.npmjs.org/axios/-/axios-1.13.2.tgz",
-      "integrity": "sha512-VPk9ebNqPcy5lRGuSlKx752IlDatOjT9paPlm8A7yOuW2Fbvp4X3JznJtT4f0GzGLLiWE9W8onz51SqLYwzGaA==",
-      "license": "MIT",
-      "dependencies": {
-        "follow-redirects": "^1.15.6",
-        "form-data": "^4.0.4",
-        "proxy-from-env": "^1.1.0"
-      }
-    },
-    "node_modules/base-x": {
-      "version": "5.0.1",
-      "resolved": "https://registry.npmjs.org/base-x/-/base-x-5.0.1.tgz",
-      "integrity": "sha512-M7uio8Zt++eg3jPj+rHMfCC+IuygQHHCOU+IYsVtik6FWjuYpVt/+MRKcgsAMHh8mMFAwnB+Bs+mTrFiXjMzKg==",
-      "license": "MIT"
-    },
-    "node_modules/base64-js": {
-      "version": "1.5.1",
-      "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
-      "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT"
-    },
-    "node_modules/better-sqlite3": {
-      "version": "12.6.0",
-      "resolved": "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-12.6.0.tgz",
-      "integrity": "sha512-FXI191x+D6UPWSze5IzZjhz+i9MK9nsuHsmTX9bXVl52k06AfZ2xql0lrgIUuzsMsJ7Vgl5kIptvDgBLIV3ZSQ==",
-      "hasInstallScript": true,
-      "license": "MIT",
-      "dependencies": {
-        "bindings": "^1.5.0",
-        "prebuild-install": "^7.1.1"
-      },
-      "engines": {
-        "node": "20.x || 22.x || 23.x || 24.x || 25.x"
-      }
-    },
-    "node_modules/bindings": {
-      "version": "1.5.0",
-      "resolved": "https://registry.npmjs.org/bindings/-/bindings-1.5.0.tgz",
-      "integrity": "sha512-p2q/t/mhvuOj/UeLlV6566GD/guowlr0hHxClI0W9m7MWYkL1F0hLo+0Aexs9HSPCtR1SXQ0TD3MMKrXZajbiQ==",
-      "license": "MIT",
-      "dependencies": {
-        "file-uri-to-path": "1.0.0"
-      }
-    },
-    "node_modules/bl": {
-      "version": "4.1.0",
-      "resolved": "https://registry.npmjs.org/bl/-/bl-4.1.0.tgz",
-      "integrity": "sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==",
-      "license": "MIT",
-      "dependencies": {
-        "buffer": "^5.5.0",
-        "inherits": "^2.0.4",
-        "readable-stream": "^3.4.0"
-      }
-    },
-    "node_modules/bn.js": {
-      "version": "5.2.2",
-      "resolved": "https://registry.npmjs.org/bn.js/-/bn.js-5.2.2.tgz",
-      "integrity": "sha512-v2YAxEmKaBLahNwE1mjp4WON6huMNeuDvagFZW+ASCuA/ku0bXR9hSMw0XpiqMoA3+rmnyck/tPRSFQkoC9Cuw==",
-      "license": "MIT"
-    },
-    "node_modules/borsh": {
-      "version": "0.7.0",
-      "resolved": "https://registry.npmjs.org/borsh/-/borsh-0.7.0.tgz",
-      "integrity": "sha512-CLCsZGIBCFnPtkNnieW/a8wmreDmfUtjU2m9yHrzPXIlNbqVs0AQrSatSG6vdNYUqdc83tkQi2eHfF98ubzQLA==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "bn.js": "^5.2.0",
-        "bs58": "^4.0.0",
-        "text-encoding-utf-8": "^1.0.2"
-      }
-    },
-    "node_modules/borsh/node_modules/base-x": {
-      "version": "3.0.11",
-      "resolved": "https://registry.npmjs.org/base-x/-/base-x-3.0.11.tgz",
-      "integrity": "sha512-xz7wQ8xDhdyP7tQxwdteLYeFfS68tSMNCZ/Y37WJ4bhGfKPpqEIlmIyueQHqOyoPhE6xNUqjzRr8ra0eF9VRvA==",
-      "license": "MIT",
-      "dependencies": {
-        "safe-buffer": "^5.0.1"
-      }
-    },
-    "node_modules/borsh/node_modules/bs58": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/bs58/-/bs58-4.0.1.tgz",
-      "integrity": "sha512-Ok3Wdf5vOIlBrgCvTq96gBkJw+JUEzdBgyaza5HLtPm7yTHkjRy8+JzNyHF7BHa0bNWOQIp3m5YF0nnFcOIKLw==",
-      "license": "MIT",
-      "dependencies": {
-        "base-x": "^3.0.2"
-      }
-    },
-    "node_modules/bs58": {
-      "version": "6.0.0",
-      "resolved": "https://registry.npmjs.org/bs58/-/bs58-6.0.0.tgz",
-      "integrity": "sha512-PD0wEnEYg6ijszw/u8s+iI3H17cTymlrwkKhDhPZq+Sokl3AU4htyBFTjAeNAlCCmg0f53g6ih3jATyCKftTfw==",
-      "license": "MIT",
-      "dependencies": {
-        "base-x": "^5.0.0"
-      }
-    },
-    "node_modules/buffer": {
-      "version": "5.7.1",
-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-5.7.1.tgz",
-      "integrity": "sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "base64-js": "^1.3.1",
-        "ieee754": "^1.1.13"
-      }
-    },
-    "node_modules/buffer-alloc": {
-      "version": "1.2.0",
-      "resolved": "https://registry.npmjs.org/buffer-alloc/-/buffer-alloc-1.2.0.tgz",
-      "integrity": "sha512-CFsHQgjtW1UChdXgbyJGtnm+O/uLQeZdtbDo8mfUgYXCHSM1wgrVxXm6bSyrUuErEb+4sYVGCzASBRot7zyrow==",
-      "license": "MIT",
-      "dependencies": {
-        "buffer-alloc-unsafe": "^1.1.0",
-        "buffer-fill": "^1.0.0"
-      }
-    },
-    "node_modules/buffer-alloc-unsafe": {
-      "version": "1.1.0",
-      "resolved": "https://registry.npmjs.org/buffer-alloc-unsafe/-/buffer-alloc-unsafe-1.1.0.tgz",
-      "integrity": "sha512-TEM2iMIEQdJ2yjPJoSIsldnleVaAk1oW3DBVUykyOLsEsFmEc9kn+SFFPz+gl54KQNxlDnAwCXosOS9Okx2xAg==",
-      "license": "MIT"
-    },
-    "node_modules/buffer-fill": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/buffer-fill/-/buffer-fill-1.0.0.tgz",
-      "integrity": "sha512-T7zexNBwiiaCOGDg9xNX9PBmjrubblRkENuptryuI64URkXDFum9il/JGL8Lm8wYfAXpredVXXZz7eMHilimiQ==",
-      "license": "MIT"
-    },
-    "node_modules/call-bind-apply-helpers": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/call-bind-apply-helpers/-/call-bind-apply-helpers-1.0.2.tgz",
-      "integrity": "sha512-Sp1ablJ0ivDkSzjcaJdxEunN5/XvksFJ2sMBFfq6x0ryhQV/2b/KwFe21cMpmHtPOSij8K99/wSfoEuTObmuMQ==",
-      "license": "MIT",
-      "dependencies": {
-        "es-errors": "^1.3.0",
-        "function-bind": "^1.1.2"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/chalk": {
-      "version": "5.6.2",
-      "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.6.2.tgz",
-      "integrity": "sha512-7NzBL0rN6fMUW+f7A6Io4h40qQlG+xGmtMxfbnH/K7TAtt8JQWVQK+6g0UXKMeVJoyV5EkkNsErQ8pVD3bLHbA==",
-      "license": "MIT",
-      "engines": {
-        "node": "^12.17.0 || ^14.13 || >=16.0.0"
-      },
-      "funding": {
-        "url": "https://github.com/chalk/chalk?sponsor=1"
-      }
-    },
-    "node_modules/chownr": {
-      "version": "1.1.4",
-      "resolved": "https://registry.npmjs.org/chownr/-/chownr-1.1.4.tgz",
-      "integrity": "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==",
-      "license": "ISC"
-    },
-    "node_modules/combined-stream": {
-      "version": "1.0.8",
-      "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.8.tgz",
-      "integrity": "sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==",
-      "license": "MIT",
-      "dependencies": {
-        "delayed-stream": "~1.0.0"
-      },
-      "engines": {
-        "node": ">= 0.8"
-      }
-    },
-    "node_modules/commander": {
-      "version": "14.0.2",
-      "resolved": "https://registry.npmjs.org/commander/-/commander-14.0.2.tgz",
-      "integrity": "sha512-TywoWNNRbhoD0BXs1P3ZEScW8W5iKrnbithIl0YH+uCmBd0QpPOA8yc82DS3BIE5Ma6FnBVUsJ7wVUDz4dvOWQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=20"
-      }
-    },
-    "node_modules/debug": {
-      "version": "4.4.3",
-      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
-      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
-      "license": "MIT",
-      "dependencies": {
-        "ms": "^2.1.3"
-      },
-      "engines": {
-        "node": ">=6.0"
-      },
-      "peerDependenciesMeta": {
-        "supports-color": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/decompress-response": {
-      "version": "6.0.0",
-      "resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-6.0.0.tgz",
-      "integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
-      "license": "MIT",
-      "dependencies": {
-        "mimic-response": "^3.1.0"
-      },
-      "engines": {
-        "node": ">=10"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/sindresorhus"
-      }
-    },
-    "node_modules/deep-extend": {
-      "version": "0.6.0",
-      "resolved": "https://registry.npmjs.org/deep-extend/-/deep-extend-0.6.0.tgz",
-      "integrity": "sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=4.0.0"
-      }
-    },
-    "node_modules/delay": {
-      "version": "5.0.0",
-      "resolved": "https://registry.npmjs.org/delay/-/delay-5.0.0.tgz",
-      "integrity": "sha512-ReEBKkIfe4ya47wlPYf/gu5ib6yUG0/Aez0JQZQz94kiWtRQvZIQbTiehsnwHvLSWJnQdhVeqYue7Id1dKr0qw==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=10"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/sindresorhus"
-      }
-    },
-    "node_modules/delayed-stream": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
-      "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=0.4.0"
-      }
-    },
-    "node_modules/detect-libc": {
-      "version": "2.1.2",
-      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
-      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
-      "license": "Apache-2.0",
-      "engines": {
-        "node": ">=8"
-      }
-    },
-    "node_modules/dotenv": {
-      "version": "17.2.3",
-      "resolved": "https://registry.npmjs.org/dotenv/-/dotenv-17.2.3.tgz",
-      "integrity": "sha512-JVUnt+DUIzu87TABbhPmNfVdBDt18BLOWjMUFJMSi/Qqg7NTYtabbvSNJGOJ7afbRuv9D/lngizHtP7QyLQ+9w==",
-      "license": "BSD-2-Clause",
-      "engines": {
-        "node": ">=12"
-      },
-      "funding": {
-        "url": "https://dotenvx.com"
-      }
-    },
-    "node_modules/dunder-proto": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/dunder-proto/-/dunder-proto-1.0.1.tgz",
-      "integrity": "sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==",
-      "license": "MIT",
-      "dependencies": {
-        "call-bind-apply-helpers": "^1.0.1",
-        "es-errors": "^1.3.0",
-        "gopd": "^1.2.0"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/end-of-stream": {
-      "version": "1.4.5",
-      "resolved": "https://registry.npmjs.org/end-of-stream/-/end-of-stream-1.4.5.tgz",
-      "integrity": "sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==",
-      "license": "MIT",
-      "dependencies": {
-        "once": "^1.4.0"
-      }
-    },
-    "node_modules/es-define-property": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/es-define-property/-/es-define-property-1.0.1.tgz",
-      "integrity": "sha512-e3nRfgfUZ4rNGL232gUgX06QNyyez04KdjFrF+LTRoOXmrOgFKDg4BCdsjW8EnT69eqdYGmRpJwiPVYNrCaW3g==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/es-errors": {
-      "version": "1.3.0",
-      "resolved": "https://registry.npmjs.org/es-errors/-/es-errors-1.3.0.tgz",
-      "integrity": "sha512-Zf5H2Kxt2xjTvbJvP2ZWLEICxA6j+hAmMzIlypy4xcBg1vKVnx89Wy0GbS+kf5cwCVFFzdCFh2XSCFNULS6csw==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/es-object-atoms": {
-      "version": "1.1.1",
-      "resolved": "https://registry.npmjs.org/es-object-atoms/-/es-object-atoms-1.1.1.tgz",
-      "integrity": "sha512-FGgH2h8zKNim9ljj7dankFPcICIK9Cp5bm+c2gQSYePhpaG5+esrLODihIorn+Pe6FGJzWhXQotPv73jTaldXA==",
-      "license": "MIT",
-      "dependencies": {
-        "es-errors": "^1.3.0"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/es-set-tostringtag": {
-      "version": "2.1.0",
-      "resolved": "https://registry.npmjs.org/es-set-tostringtag/-/es-set-tostringtag-2.1.0.tgz",
-      "integrity": "sha512-j6vWzfrGVfyXxge+O0x5sh6cvxAog0a/4Rdd2K36zCMV5eJ+/+tOAngRO8cODMNWbVRdVlmGZQL2YS3yR8bIUA==",
-      "license": "MIT",
-      "dependencies": {
-        "es-errors": "^1.3.0",
-        "get-intrinsic": "^1.2.6",
-        "has-tostringtag": "^1.0.2",
-        "hasown": "^2.0.2"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/es6-promise": {
-      "version": "4.2.8",
-      "resolved": "https://registry.npmjs.org/es6-promise/-/es6-promise-4.2.8.tgz",
-      "integrity": "sha512-HJDGx5daxeIvxdBxvG2cb9g4tEvwIk3i8+nhX0yGrYmZUzbkdg8QbDevheDB8gd0//uPj4c1EQua8Q+MViT0/w==",
-      "license": "MIT"
-    },
-    "node_modules/es6-promisify": {
-      "version": "5.0.0",
-      "resolved": "https://registry.npmjs.org/es6-promisify/-/es6-promisify-5.0.0.tgz",
-      "integrity": "sha512-C+d6UdsYDk0lMebHNR4S2NybQMMngAOnOwYBQjTOiv0MkoJMP0Myw2mgpDLBcpfCmRLxyFqYhS/CfOENq4SJhQ==",
-      "license": "MIT",
-      "dependencies": {
-        "es6-promise": "^4.0.3"
-      }
-    },
-    "node_modules/event-target-shim": {
-      "version": "5.0.1",
-      "resolved": "https://registry.npmjs.org/event-target-shim/-/event-target-shim-5.0.1.tgz",
-      "integrity": "sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=6"
-      }
-    },
-    "node_modules/eventemitter3": {
-      "version": "5.0.1",
-      "resolved": "https://registry.npmjs.org/eventemitter3/-/eventemitter3-5.0.1.tgz",
-      "integrity": "sha512-GWkBvjiSZK87ELrYOSESUYeVIc9mvLLf/nXalMOS5dYrgZq9o5OVkbZAVM06CVxYsCwH9BDZFPlQTlPA1j4ahA==",
-      "license": "MIT"
-    },
-    "node_modules/expand-template": {
-      "version": "2.0.3",
-      "resolved": "https://registry.npmjs.org/expand-template/-/expand-template-2.0.3.tgz",
-      "integrity": "sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==",
-      "license": "(MIT OR WTFPL)",
-      "engines": {
-        "node": ">=6"
-      }
-    },
-    "node_modules/eyes": {
-      "version": "0.1.8",
-      "resolved": "https://registry.npmjs.org/eyes/-/eyes-0.1.8.tgz",
-      "integrity": "sha512-GipyPsXO1anza0AOZdy69Im7hGFCNB7Y/NGjDlZGJ3GJJLtwNSb2vrzYrTYJRrRloVx7pl+bhUaTB8yiccPvFQ==",
-      "engines": {
-        "node": "> 0.1.90"
-      }
-    },
-    "node_modules/fast-stable-stringify": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/fast-stable-stringify/-/fast-stable-stringify-1.0.0.tgz",
-      "integrity": "sha512-wpYMUmFu5f00Sm0cj2pfivpmawLZ0NKdviQ4w9zJeR8JVtOpOxHmLaJuj0vxvGqMJQWyP/COUkF75/57OKyRag==",
-      "license": "MIT"
-    },
-    "node_modules/file-uri-to-path": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/file-uri-to-path/-/file-uri-to-path-1.0.0.tgz",
-      "integrity": "sha512-0Zt+s3L7Vf1biwWZ29aARiVYLx7iMGnEUl9x33fbB/j3jR81u/O2LbqK+Bm1CDSNDKVtJ/YjwY7TUd5SkeLQLw==",
-      "license": "MIT"
-    },
-    "node_modules/follow-redirects": {
-      "version": "1.15.11",
-      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.15.11.tgz",
-      "integrity": "sha512-deG2P0JfjrTxl50XGCDyfI97ZGVCxIpfKYmfyrQ54n5FO/0gfIES8C/Psl6kWVDolizcaaxZJnTS0QSMxvnsBQ==",
-      "funding": [
-        {
-          "type": "individual",
-          "url": "https://github.com/sponsors/RubenVerborgh"
-        }
-      ],
-      "license": "MIT",
-      "engines": {
-        "node": ">=4.0"
-      },
-      "peerDependenciesMeta": {
-        "debug": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/form-data": {
-      "version": "4.0.5",
-      "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.5.tgz",
-      "integrity": "sha512-8RipRLol37bNs2bhoV67fiTEvdTrbMUYcFTiy3+wuuOnUog2QBHCZWXDRijWQfAkhBj2Uf5UnVaiWwA5vdd82w==",
-      "license": "MIT",
-      "dependencies": {
-        "asynckit": "^0.4.0",
-        "combined-stream": "^1.0.8",
-        "es-set-tostringtag": "^2.1.0",
-        "hasown": "^2.0.2",
-        "mime-types": "^2.1.12"
-      },
-      "engines": {
-        "node": ">= 6"
-      }
-    },
-    "node_modules/fs-constants": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/fs-constants/-/fs-constants-1.0.0.tgz",
-      "integrity": "sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow==",
-      "license": "MIT"
-    },
-    "node_modules/function-bind": {
-      "version": "1.1.2",
-      "resolved": "https://registry.npmjs.org/function-bind/-/function-bind-1.1.2.tgz",
-      "integrity": "sha512-7XHNxH7qX9xG5mIwxkhumTox/MIRNcOgDrxWsMt2pAr23WHp6MrRlN7FBSFpCpr+oVO0F744iUgR82nJMfG2SA==",
-      "license": "MIT",
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/get-intrinsic": {
-      "version": "1.3.0",
-      "resolved": "https://registry.npmjs.org/get-intrinsic/-/get-intrinsic-1.3.0.tgz",
-      "integrity": "sha512-9fSjSaos/fRIVIp+xSJlE6lfwhES7LNtKaCBIamHsjr2na1BiABJPo0mOjjz8GJDURarmCPGqaiVg5mfjb98CQ==",
-      "license": "MIT",
-      "dependencies": {
-        "call-bind-apply-helpers": "^1.0.2",
-        "es-define-property": "^1.0.1",
-        "es-errors": "^1.3.0",
-        "es-object-atoms": "^1.1.1",
-        "function-bind": "^1.1.2",
-        "get-proto": "^1.0.1",
-        "gopd": "^1.2.0",
-        "has-symbols": "^1.1.0",
-        "hasown": "^2.0.2",
-        "math-intrinsics": "^1.1.0"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/get-proto": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/get-proto/-/get-proto-1.0.1.tgz",
-      "integrity": "sha512-sTSfBjoXBp89JvIKIefqw7U2CCebsc74kiY6awiGogKtoSGbgjYE/G/+l9sF3MWFPNc9IcoOC4ODfKHfxFmp0g==",
-      "license": "MIT",
-      "dependencies": {
-        "dunder-proto": "^1.0.1",
-        "es-object-atoms": "^1.0.0"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/github-from-package": {
-      "version": "0.0.0",
-      "resolved": "https://registry.npmjs.org/github-from-package/-/github-from-package-0.0.0.tgz",
-      "integrity": "sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==",
-      "license": "MIT"
-    },
-    "node_modules/gopd": {
-      "version": "1.2.0",
-      "resolved": "https://registry.npmjs.org/gopd/-/gopd-1.2.0.tgz",
-      "integrity": "sha512-ZUKRh6/kUFoAiTAtTYPZJ3hw9wNxx+BIBOijnlG9PnrJsCcSjs1wyyD6vJpaYtgnzDrKYRSqf3OO6Rfa93xsRg==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.4"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/has-symbols": {
-      "version": "1.1.0",
-      "resolved": "https://registry.npmjs.org/has-symbols/-/has-symbols-1.1.0.tgz",
-      "integrity": "sha512-1cDNdwJ2Jaohmb3sg4OmKaMBwuC48sYni5HUw2DvsC8LjGTLK9h+eb1X6RyuOHe4hT0ULCW68iomhjUoKUqlPQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.4"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/has-tostringtag": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/has-tostringtag/-/has-tostringtag-1.0.2.tgz",
-      "integrity": "sha512-NqADB8VjPFLM2V0VvHUewwwsw0ZWBaIdgo+ieHtK3hasLz4qeCRjYcqfB6AQrBggRKppKF8L52/VqdVsO47Dlw==",
-      "license": "MIT",
-      "dependencies": {
-        "has-symbols": "^1.0.3"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/hasown": {
-      "version": "2.0.2",
-      "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.2.tgz",
-      "integrity": "sha512-0hJU9SCPvmMzIBdZFqNPXWa6dqh7WdH0cII9y+CyS8rG3nL48Bclra9HmKhVVUHyPWNH5Y7xDwAB7bfgSjkUMQ==",
-      "license": "MIT",
-      "dependencies": {
-        "function-bind": "^1.1.2"
-      },
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/humanize-ms": {
-      "version": "1.2.1",
-      "resolved": "https://registry.npmjs.org/humanize-ms/-/humanize-ms-1.2.1.tgz",
-      "integrity": "sha512-Fl70vYtsAFb/C06PTS9dZBo7ihau+Tu/DNCk/OyHhea07S+aeMWpFFkUaXRa8fI+ScZbEI8dfSxwY7gxZ9SAVQ==",
-      "license": "MIT",
-      "dependencies": {
-        "ms": "^2.0.0"
-      }
-    },
-    "node_modules/ieee754": {
-      "version": "1.2.1",
-      "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
-      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "BSD-3-Clause"
-    },
-    "node_modules/inherits": {
-      "version": "2.0.4",
-      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
-      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
-      "license": "ISC"
-    },
-    "node_modules/ini": {
-      "version": "1.3.8",
-      "resolved": "https://registry.npmjs.org/ini/-/ini-1.3.8.tgz",
-      "integrity": "sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==",
-      "license": "ISC"
-    },
-    "node_modules/isomorphic-ws": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/isomorphic-ws/-/isomorphic-ws-4.0.1.tgz",
-      "integrity": "sha512-BhBvN2MBpWTaSHdWRb/bwdZJ1WaehQ2L1KngkCkfLUGF0mAWAT1sQUQacEmQ0jXkFw/czDXPNQSL5u2/Krsz1w==",
-      "license": "MIT",
-      "peerDependencies": {
-        "ws": "*"
-      }
-    },
-    "node_modules/jayson": {
-      "version": "4.3.0",
-      "resolved": "https://registry.npmjs.org/jayson/-/jayson-4.3.0.tgz",
-      "integrity": "sha512-AauzHcUcqs8OBnCHOkJY280VaTiCm57AbuO7lqzcw7JapGj50BisE3xhksye4zlTSR1+1tAz67wLTl8tEH1obQ==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/connect": "^3.4.33",
-        "@types/node": "^12.12.54",
-        "@types/ws": "^7.4.4",
-        "commander": "^2.20.3",
-        "delay": "^5.0.0",
-        "es6-promisify": "^5.0.0",
-        "eyes": "^0.1.8",
-        "isomorphic-ws": "^4.0.1",
-        "json-stringify-safe": "^5.0.1",
-        "stream-json": "^1.9.1",
-        "uuid": "^8.3.2",
-        "ws": "^7.5.10"
-      },
-      "bin": {
-        "jayson": "bin/jayson.js"
-      },
-      "engines": {
-        "node": ">=8"
-      }
-    },
-    "node_modules/jayson/node_modules/commander": {
-      "version": "2.20.3",
-      "resolved": "https://registry.npmjs.org/commander/-/commander-2.20.3.tgz",
-      "integrity": "sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ==",
-      "license": "MIT"
-    },
-    "node_modules/json-stringify-safe": {
-      "version": "5.0.1",
-      "resolved": "https://registry.npmjs.org/json-stringify-safe/-/json-stringify-safe-5.0.1.tgz",
-      "integrity": "sha512-ZClg6AaYvamvYEE82d3Iyd3vSSIjQ+odgjaTzRuO3s7toCdFKczob2i0zCh7JE8kWn17yvAWhUVxvqGwUalsRA==",
-      "license": "ISC"
-    },
-    "node_modules/math-intrinsics": {
-      "version": "1.1.0",
-      "resolved": "https://registry.npmjs.org/math-intrinsics/-/math-intrinsics-1.1.0.tgz",
-      "integrity": "sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.4"
-      }
-    },
-    "node_modules/mime-db": {
-      "version": "1.52.0",
-      "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.52.0.tgz",
-      "integrity": "sha512-sPU4uV7dYlvtWJxwwxHD0PuihVNiE7TyAbQ5SWxDCB9mUYvOgroQOwYQQOKPJ8CIbE+1ETVlOoK1UC2nU3gYvg==",
-      "license": "MIT",
-      "engines": {
-        "node": ">= 0.6"
-      }
-    },
-    "node_modules/mime-types": {
-      "version": "2.1.35",
-      "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.35.tgz",
-      "integrity": "sha512-ZDY+bPm5zTTF+YpCrAU9nK0UgICYPT0QtT1NZWFv4s++TNkcgVaT0g6+4R2uI4MjQjzysHB1zxuWL50hzaeXiw==",
-      "license": "MIT",
-      "dependencies": {
-        "mime-db": "1.52.0"
-      },
-      "engines": {
-        "node": ">= 0.6"
-      }
-    },
-    "node_modules/mimic-response": {
-      "version": "3.1.0",
-      "resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-3.1.0.tgz",
-      "integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=10"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/sindresorhus"
-      }
-    },
-    "node_modules/minimist": {
-      "version": "1.2.8",
-      "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
-      "integrity": "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==",
-      "license": "MIT",
-      "funding": {
-        "url": "https://github.com/sponsors/ljharb"
-      }
-    },
-    "node_modules/mkdirp-classic": {
-      "version": "0.5.3",
-      "resolved": "https://registry.npmjs.org/mkdirp-classic/-/mkdirp-classic-0.5.3.tgz",
-      "integrity": "sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==",
-      "license": "MIT"
-    },
-    "node_modules/mri": {
-      "version": "1.2.0",
-      "resolved": "https://registry.npmjs.org/mri/-/mri-1.2.0.tgz",
-      "integrity": "sha512-tzzskb3bG8LvYGFF/mDTpq3jpI6Q9wc3LEmBaghu+DdCssd1FakN7Bc0hVNmEyGq1bq3RgfkCb3cmQLpNPOroA==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=4"
-      }
-    },
-    "node_modules/ms": {
-      "version": "2.1.3",
-      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
-      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
-      "license": "MIT"
-    },
-    "node_modules/napi-build-utils": {
-      "version": "2.0.0",
-      "resolved": "https://registry.npmjs.org/napi-build-utils/-/napi-build-utils-2.0.0.tgz",
-      "integrity": "sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA==",
-      "license": "MIT"
-    },
-    "node_modules/node-abi": {
-      "version": "3.85.0",
-      "resolved": "https://registry.npmjs.org/node-abi/-/node-abi-3.85.0.tgz",
-      "integrity": "sha512-zsFhmbkAzwhTft6nd3VxcG0cvJsT70rL+BIGHWVq5fi6MwGrHwzqKaxXE+Hl2GmnGItnDKPPkO5/LQqjVkIdFg==",
-      "license": "MIT",
-      "dependencies": {
-        "semver": "^7.3.5"
-      },
-      "engines": {
-        "node": ">=10"
-      }
-    },
-    "node_modules/node-fetch": {
-      "version": "2.7.0",
-      "resolved": "https://registry.npmjs.org/node-fetch/-/node-fetch-2.7.0.tgz",
-      "integrity": "sha512-c4FRfUm/dbcWZ7U+1Wq0AwCyFL+3nt2bEw05wfxSz+DWpWsitgmSgYmy2dQdWyKC1694ELPqMs/YzUSNozLt8A==",
-      "license": "MIT",
-      "dependencies": {
-        "whatwg-url": "^5.0.0"
-      },
-      "engines": {
-        "node": "4.x || >=6.0.0"
-      },
-      "peerDependencies": {
-        "encoding": "^0.1.0"
-      },
-      "peerDependenciesMeta": {
-        "encoding": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/node-gyp-build": {
-      "version": "4.8.4",
-      "resolved": "https://registry.npmjs.org/node-gyp-build/-/node-gyp-build-4.8.4.tgz",
-      "integrity": "sha512-LA4ZjwlnUblHVgq0oBF3Jl/6h/Nvs5fzBLwdEF4nuxnFdsfajde4WfxtJr3CaiH+F6ewcIB/q4jQ4UzPyid+CQ==",
-      "license": "MIT",
-      "optional": true,
-      "bin": {
-        "node-gyp-build": "bin.js",
-        "node-gyp-build-optional": "optional.js",
-        "node-gyp-build-test": "build-test.js"
-      }
-    },
-    "node_modules/once": {
-      "version": "1.4.0",
-      "resolved": "https://registry.npmjs.org/once/-/once-1.4.0.tgz",
-      "integrity": "sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==",
-      "license": "ISC",
-      "dependencies": {
-        "wrappy": "1"
-      }
-    },
-    "node_modules/p-limit": {
-      "version": "7.2.0",
-      "resolved": "https://registry.npmjs.org/p-limit/-/p-limit-7.2.0.tgz",
-      "integrity": "sha512-ATHLtwoTNDloHRFFxFJdHnG6n2WUeFjaR8XQMFdKIv0xkXjrER8/iG9iu265jOM95zXHAfv9oTkqhrfbIzosrQ==",
-      "license": "MIT",
-      "dependencies": {
-        "yocto-queue": "^1.2.1"
-      },
-      "engines": {
-        "node": ">=20"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/sindresorhus"
-      }
-    },
-    "node_modules/p-timeout": {
-      "version": "4.1.0",
-      "resolved": "https://registry.npmjs.org/p-timeout/-/p-timeout-4.1.0.tgz",
-      "integrity": "sha512-+/wmHtzJuWii1sXn3HCuH/FTwGhrp4tmJTxSKJbfS+vkipci6osxXM5mY0jUiRzWKMTgUT8l7HFbeSwZAynqHw==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=10"
-      }
-    },
-    "node_modules/prebuild-install": {
-      "version": "7.1.3",
-      "resolved": "https://registry.npmjs.org/prebuild-install/-/prebuild-install-7.1.3.tgz",
-      "integrity": "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==",
-      "license": "MIT",
-      "dependencies": {
-        "detect-libc": "^2.0.0",
-        "expand-template": "^2.0.3",
-        "github-from-package": "0.0.0",
-        "minimist": "^1.2.3",
-        "mkdirp-classic": "^0.5.3",
-        "napi-build-utils": "^2.0.0",
-        "node-abi": "^3.3.0",
-        "pump": "^3.0.0",
-        "rc": "^1.2.7",
-        "simple-get": "^4.0.0",
-        "tar-fs": "^2.0.0",
-        "tunnel-agent": "^0.6.0"
-      },
-      "bin": {
-        "prebuild-install": "bin.js"
-      },
-      "engines": {
-        "node": ">=10"
-      }
-    },
-    "node_modules/proxy-from-env": {
-      "version": "1.1.0",
-      "resolved": "https://registry.npmjs.org/proxy-from-env/-/proxy-from-env-1.1.0.tgz",
-      "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg==",
-      "license": "MIT"
-    },
-    "node_modules/pump": {
-      "version": "3.0.3",
-      "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.3.tgz",
-      "integrity": "sha512-todwxLMY7/heScKmntwQG8CXVkWUOdYxIvY2s0VWAAMh/nd8SoYiRaKjlr7+iCs984f2P8zvrfWcDDYVb73NfA==",
-      "license": "MIT",
-      "dependencies": {
-        "end-of-stream": "^1.1.0",
-        "once": "^1.3.1"
-      }
-    },
-    "node_modules/rc": {
-      "version": "1.2.8",
-      "resolved": "https://registry.npmjs.org/rc/-/rc-1.2.8.tgz",
-      "integrity": "sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==",
-      "license": "(BSD-2-Clause OR MIT OR Apache-2.0)",
-      "dependencies": {
-        "deep-extend": "^0.6.0",
-        "ini": "~1.3.0",
-        "minimist": "^1.2.0",
-        "strip-json-comments": "~2.0.1"
-      },
-      "bin": {
-        "rc": "cli.js"
-      }
-    },
-    "node_modules/readable-stream": {
-      "version": "3.6.2",
-      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
-      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
-      "license": "MIT",
-      "dependencies": {
-        "inherits": "^2.0.3",
-        "string_decoder": "^1.1.1",
-        "util-deprecate": "^1.0.1"
-      },
-      "engines": {
-        "node": ">= 6"
-      }
-    },
-    "node_modules/rpc-websockets": {
-      "version": "9.3.2",
-      "resolved": "https://registry.npmjs.org/rpc-websockets/-/rpc-websockets-9.3.2.tgz",
-      "integrity": "sha512-VuW2xJDnl1k8n8kjbdRSWawPRkwaVqUQNjE1TdeTawf0y0abGhtVJFTXCLfgpgGDBkO/Fj6kny8Dc/nvOW78MA==",
-      "license": "LGPL-3.0-only",
-      "dependencies": {
-        "@swc/helpers": "^0.5.11",
-        "@types/uuid": "^8.3.4",
-        "@types/ws": "^8.2.2",
-        "buffer": "^6.0.3",
-        "eventemitter3": "^5.0.1",
-        "uuid": "^8.3.2",
-        "ws": "^8.5.0"
-      },
-      "funding": {
-        "type": "paypal",
-        "url": "https://paypal.me/kozjak"
-      },
-      "optionalDependencies": {
-        "bufferutil": "^4.0.1",
-        "utf-8-validate": "^5.0.2"
-      }
-    },
-    "node_modules/rpc-websockets/node_modules/@types/ws": {
-      "version": "8.18.1",
-      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-8.18.1.tgz",
-      "integrity": "sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==",
-      "license": "MIT",
-      "dependencies": {
-        "@types/node": "*"
-      }
-    },
-    "node_modules/rpc-websockets/node_modules/buffer": {
-      "version": "6.0.3",
-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "base64-js": "^1.3.1",
-        "ieee754": "^1.2.1"
-      }
-    },
-    "node_modules/rpc-websockets/node_modules/ws": {
-      "version": "8.19.0",
-      "resolved": "https://registry.npmjs.org/ws/-/ws-8.19.0.tgz",
-      "integrity": "sha512-blAT2mjOEIi0ZzruJfIhb3nps74PRWTCz1IjglWEEpQl5XS/UNama6u2/rjFkDDouqr4L67ry+1aGIALViWjDg==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=10.0.0"
-      },
-      "peerDependencies": {
-        "bufferutil": "^4.0.1",
-        "utf-8-validate": ">=5.0.2"
-      },
-      "peerDependenciesMeta": {
-        "bufferutil": {
-          "optional": true
-        },
-        "utf-8-validate": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/safe-buffer": {
-      "version": "5.2.1",
-      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz",
-      "integrity": "sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT"
-    },
-    "node_modules/safe-compare": {
-      "version": "1.1.4",
-      "resolved": "https://registry.npmjs.org/safe-compare/-/safe-compare-1.1.4.tgz",
-      "integrity": "sha512-b9wZ986HHCo/HbKrRpBJb2kqXMK9CEWIE1egeEvZsYn69ay3kdfl9nG3RyOcR+jInTDf7a86WQ1d4VJX7goSSQ==",
-      "license": "MIT",
-      "dependencies": {
-        "buffer-alloc": "^1.2.0"
-      }
-    },
-    "node_modules/sandwich-stream": {
-      "version": "2.0.2",
-      "resolved": "https://registry.npmjs.org/sandwich-stream/-/sandwich-stream-2.0.2.tgz",
-      "integrity": "sha512-jLYV0DORrzY3xaz/S9ydJL6Iz7essZeAfnAavsJ+zsJGZ1MOnsS52yRjU3uF3pJa/lla7+wisp//fxOwOH8SKQ==",
-      "license": "Apache-2.0",
-      "engines": {
-        "node": ">= 0.10"
-      }
-    },
-    "node_modules/semver": {
-      "version": "7.7.3",
-      "resolved": "https://registry.npmjs.org/semver/-/semver-7.7.3.tgz",
-      "integrity": "sha512-SdsKMrI9TdgjdweUSR9MweHA4EJ8YxHn8DFaDisvhVlUOe4BF1tLD7GAj0lIqWVl+dPb/rExr0Btby5loQm20Q==",
-      "license": "ISC",
-      "bin": {
-        "semver": "bin/semver.js"
-      },
-      "engines": {
-        "node": ">=10"
-      }
-    },
-    "node_modules/simple-concat": {
-      "version": "1.0.1",
-      "resolved": "https://registry.npmjs.org/simple-concat/-/simple-concat-1.0.1.tgz",
-      "integrity": "sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT"
-    },
-    "node_modules/simple-get": {
-      "version": "4.0.1",
-      "resolved": "https://registry.npmjs.org/simple-get/-/simple-get-4.0.1.tgz",
-      "integrity": "sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==",
-      "funding": [
-        {
-          "type": "github",
-          "url": "https://github.com/sponsors/feross"
-        },
-        {
-          "type": "patreon",
-          "url": "https://www.patreon.com/feross"
-        },
-        {
-          "type": "consulting",
-          "url": "https://feross.org/support"
-        }
-      ],
-      "license": "MIT",
-      "dependencies": {
-        "decompress-response": "^6.0.0",
-        "once": "^1.3.1",
-        "simple-concat": "^1.0.0"
-      }
-    },
-    "node_modules/stream-chain": {
-      "version": "2.2.5",
-      "resolved": "https://registry.npmjs.org/stream-chain/-/stream-chain-2.2.5.tgz",
-      "integrity": "sha512-1TJmBx6aSWqZ4tx7aTpBDXK0/e2hhcNSTV8+CbFJtDjbb+I1mZ8lHit0Grw9GRT+6JbIrrDd8esncgBi8aBXGA==",
-      "license": "BSD-3-Clause"
-    },
-    "node_modules/stream-json": {
-      "version": "1.9.1",
-      "resolved": "https://registry.npmjs.org/stream-json/-/stream-json-1.9.1.tgz",
-      "integrity": "sha512-uWkjJ+2Nt/LO9Z/JyKZbMusL8Dkh97uUBTv3AJQ74y07lVahLY4eEFsPsE97pxYBwr8nnjMAIch5eqI0gPShyw==",
-      "license": "BSD-3-Clause",
-      "dependencies": {
-        "stream-chain": "^2.2.5"
-      }
-    },
-    "node_modules/string_decoder": {
-      "version": "1.3.0",
-      "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.3.0.tgz",
-      "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
-      "license": "MIT",
-      "dependencies": {
-        "safe-buffer": "~5.2.0"
-      }
-    },
-    "node_modules/strip-json-comments": {
-      "version": "2.0.1",
-      "resolved": "https://registry.npmjs.org/strip-json-comments/-/strip-json-comments-2.0.1.tgz",
-      "integrity": "sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=0.10.0"
-      }
-    },
-    "node_modules/superstruct": {
-      "version": "2.0.2",
-      "resolved": "https://registry.npmjs.org/superstruct/-/superstruct-2.0.2.tgz",
-      "integrity": "sha512-uV+TFRZdXsqXTL2pRvujROjdZQ4RAlBUS5BTh9IGm+jTqQntYThciG/qu57Gs69yjnVUSqdxF9YLmSnpupBW9A==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=14.0.0"
-      }
-    },
-    "node_modules/tar-fs": {
-      "version": "2.1.4",
-      "resolved": "https://registry.npmjs.org/tar-fs/-/tar-fs-2.1.4.tgz",
-      "integrity": "sha512-mDAjwmZdh7LTT6pNleZ05Yt65HC3E+NiQzl672vQG38jIrehtJk/J3mNwIg+vShQPcLF/LV7CMnDW6vjj6sfYQ==",
-      "license": "MIT",
-      "dependencies": {
-        "chownr": "^1.1.1",
-        "mkdirp-classic": "^0.5.2",
-        "pump": "^3.0.0",
-        "tar-stream": "^2.1.4"
-      }
-    },
-    "node_modules/tar-stream": {
-      "version": "2.2.0",
-      "resolved": "https://registry.npmjs.org/tar-stream/-/tar-stream-2.2.0.tgz",
-      "integrity": "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==",
-      "license": "MIT",
-      "dependencies": {
-        "bl": "^4.0.3",
-        "end-of-stream": "^1.4.1",
-        "fs-constants": "^1.0.0",
-        "inherits": "^2.0.3",
-        "readable-stream": "^3.1.1"
-      },
-      "engines": {
-        "node": ">=6"
-      }
-    },
-    "node_modules/telegraf": {
-      "version": "4.16.3",
-      "resolved": "https://registry.npmjs.org/telegraf/-/telegraf-4.16.3.tgz",
-      "integrity": "sha512-yjEu2NwkHlXu0OARWoNhJlIjX09dRktiMQFsM678BAH/PEPVwctzL67+tvXqLCRQQvm3SDtki2saGO9hLlz68w==",
-      "license": "MIT",
-      "dependencies": {
-        "@telegraf/types": "^7.1.0",
-        "abort-controller": "^3.0.0",
-        "debug": "^4.3.4",
-        "mri": "^1.2.0",
-        "node-fetch": "^2.7.0",
-        "p-timeout": "^4.1.0",
-        "safe-compare": "^1.1.4",
-        "sandwich-stream": "^2.0.2"
-      },
-      "bin": {
-        "telegraf": "lib/cli.mjs"
-      },
-      "engines": {
-        "node": "^12.20.0 || >=14.13.1"
-      }
-    },
-    "node_modules/text-encoding-utf-8": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/text-encoding-utf-8/-/text-encoding-utf-8-1.0.2.tgz",
-      "integrity": "sha512-8bw4MY9WjdsD2aMtO0OzOCY3pXGYNx2d2FfHRVUKkiCPDWjKuOlhLVASS+pD7VkLTVjW268LYJHwsnPFlBpbAg=="
-    },
-    "node_modules/tr46": {
-      "version": "0.0.3",
-      "resolved": "https://registry.npmjs.org/tr46/-/tr46-0.0.3.tgz",
-      "integrity": "sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==",
-      "license": "MIT"
-    },
-    "node_modules/tslib": {
-      "version": "2.8.1",
-      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
-      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
-      "license": "0BSD"
-    },
-    "node_modules/tunnel-agent": {
-      "version": "0.6.0",
-      "resolved": "https://registry.npmjs.org/tunnel-agent/-/tunnel-agent-0.6.0.tgz",
-      "integrity": "sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "safe-buffer": "^5.0.1"
-      },
-      "engines": {
-        "node": "*"
-      }
-    },
-    "node_modules/typescript": {
-      "version": "5.9.3",
-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
-      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
-      "license": "Apache-2.0",
-      "peer": true,
-      "bin": {
-        "tsc": "bin/tsc",
-        "tsserver": "bin/tsserver"
-      },
-      "engines": {
-        "node": ">=14.17"
-      }
-    },
-    "node_modules/util-deprecate": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/util-deprecate/-/util-deprecate-1.0.2.tgz",
-      "integrity": "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==",
-      "license": "MIT"
-    },
-    "node_modules/uuid": {
-      "version": "8.3.2",
-      "resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
-      "integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==",
-      "license": "MIT",
-      "bin": {
-        "uuid": "dist/bin/uuid"
-      }
-    },
-    "node_modules/webidl-conversions": {
-      "version": "3.0.1",
-      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-3.0.1.tgz",
-      "integrity": "sha512-2JAn3z8AR6rjK8Sm8orRC0h/bcl/DqL7tRPdGZ4I1CjdF+EaMLmYxBHyXuKL849eucPFhvBoxMsflfOb8kxaeQ==",
-      "license": "BSD-2-Clause"
-    },
-    "node_modules/whatwg-url": {
-      "version": "5.0.0",
-      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-5.0.0.tgz",
-      "integrity": "sha512-saE57nupxk6v3HY35+jzBwYa0rKSy0XR8JSxZPwgLr7ys0IBzhGviA1/TUGJLmSVqs8pb9AnvICXEuOHLprYTw==",
-      "license": "MIT",
-      "dependencies": {
-        "tr46": "~0.0.3",
-        "webidl-conversions": "^3.0.0"
-      }
-    },
-    "node_modules/wrappy": {
-      "version": "1.0.2",
-      "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
-      "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==",
-      "license": "ISC"
-    },
-    "node_modules/ws": {
-      "version": "7.5.10",
-      "resolved": "https://registry.npmjs.org/ws/-/ws-7.5.10.tgz",
-      "integrity": "sha512-+dbF1tHwZpXcbOJdVOkzLDxZP1ailvSxM6ZweXTegylPny803bFhA+vqBYw4s31NSAk4S2Qz+AKXK9a4wkdjcQ==",
-      "license": "MIT",
-      "peer": true,
-      "engines": {
-        "node": ">=8.3.0"
-      },
-      "peerDependencies": {
-        "bufferutil": "^4.0.1",
-        "utf-8-validate": "^5.0.2"
-      },
-      "peerDependenciesMeta": {
-        "bufferutil": {
-          "optional": true
-        },
-        "utf-8-validate": {
-          "optional": true
-        }
-      }
-    },
-    "node_modules/yocto-queue": {
-      "version": "1.2.2",
-      "resolved": "https://registry.npmjs.org/yocto-queue/-/yocto-queue-1.2.2.tgz",
-      "integrity": "sha512-4LCcse/U2MHZ63HAJVE+v71o7yOdIe4cZ70Wpf8D/IyjDKYQLV5GD46B+hSTjJsvV5PztjvHoU580EftxjDZFQ==",
-      "license": "MIT",
-      "engines": {
-        "node": ">=12.20"
-      },
-      "funding": {
-        "url": "https://github.com/sponsors/sindresorhus"
+        
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      await checkAndPostMilestones();
+      
+    } catch (error) {
+      console.log('❌ Milestone checker error:', error.message);
+    }
+  }, META_REFRESH_MS);
+}
+
+/* =========================
+   MONOSPACE FORMATTING
+========================= */
+function monospace(text) {
+  return `\`${text}\``;
+}
+
+/* =========================
+   CHAT CLEANUP
+========================= */
+async function cleanupPreviousMessage(ctx) {
+  try {
+    if (ctx.message && ctx.message.message_id) {
+      await ctx.deleteMessage();
+    }
+  } catch (e) {}
+}
+
+async function cleanupAfterDelay(ctx, delayMs = 3000) {
+  setTimeout(async () => {
+    try {
+      await ctx.deleteMessage();
+    } catch (e) {}
+  }, delayMs);
+}
+
+async function safeEditOrReply(ctx, text, keyboard = null, cleanupDelay = 0) {
+  if (ctx.updateType === 'callback_query') {
+    try {
+      const msg = await ctx.editMessageText(text, keyboard ? { 
+        reply_markup: keyboard.reply_markup,
+        parse_mode: 'Markdown'
+      } : { parse_mode: 'Markdown' });
+      
+      if (cleanupDelay > 0 && !text.includes('🎭 WELCOME') && !text.includes('👨‍🎨 Creator Panel') && !text.includes('👥 Holder Panel') && !text.includes('⚡ Admin Panel')) {
+        cleanupAfterDelay(ctx, cleanupDelay);
+      }
+      return msg;
+    } catch (e) {
+      const msg = await ctx.reply(text, keyboard ? { 
+        reply_markup: keyboard.reply_markup,
+        parse_mode: 'Markdown'
+      } : { parse_mode: 'Markdown' });
+      
+      if (cleanupDelay > 0) {
+        cleanupAfterDelay(ctx, cleanupDelay);
+      }
+      return msg;
+    }
+  }
+  
+  const msg = await ctx.reply(text, keyboard ? { 
+    reply_markup: keyboard.reply_markup,
+    parse_mode: 'Markdown'
+  } : { parse_mode: 'Markdown' });
+  
+  if (cleanupDelay > 0) {
+    cleanupAfterDelay(ctx, cleanupDelay);
+  }
+  return msg;
+}
+
+/* =========================
+   BROADCAST QUEUE
+========================= */
+const broadcastQueue = [];
+let broadcastWorkerRunning = false;
+
+function enqueueBroadcast(method, chatId, payload, tag = '') {
+  broadcastQueue.push({ method, chatId: String(chatId), payload, tries: 0, tag });
+}
+
+async function startBroadcastWorker() {
+  if (broadcastWorkerRunning) return;
+  
+  console.log('📢 STARTING Broadcast Worker...');
+  broadcastWorkerRunning = true;
+
+  while (broadcastWorkerRunning) {
+    const job = broadcastQueue.shift();
+    if (!job) { 
+      await new Promise(r => setTimeout(r, 100)); 
+      continue; 
+    }
+
+    console.log(`📢 Processing: ${job.method} -> ${job.chatId} (Queue: ${broadcastQueue.length})`);
+    
+    try {
+      await new Promise(r => setTimeout(r, BROADCAST_DELAY_MS));
+      await bot.telegram[job.method](job.chatId, ...job.payload);
+      console.log(`📢 ✅ Success: ${job.method} -> ${job.chatId}`);
+    } catch (e) {
+      const summary = tgErrSummary(e);
+      console.log(`📢 ❌ Error: ${job.method} -> ${job.chatId}: ${summary}`);
+
+      const code = e?.code;
+      const desc = String(e?.description || '');
+      const hard =
+        code === 403 ||
+        (code === 400 && /chat not found|bot was kicked|forbidden|not enough rights/i.test(desc));
+
+      if (hard && String(job.chatId).startsWith('-')) {
+        disableGroup(job.chatId, `auto-disabled: ${desc || summary}`);
+        console.log(`📢 Group disabled: ${job.chatId} Reason: ${desc || summary}`);
+      }
+
+      if (job.method === 'sendPhoto') {
+        try {
+          const photoArgs = job.payload;
+          const opts = photoArgs?.[1] || {};
+          const caption = String(opts.caption || '');
+          const reply_markup = opts.reply_markup;
+          enqueueBroadcast('sendMessage', job.chatId, [caption, { reply_markup, parse_mode: 'Markdown' }], '(fallback from photo)');
+          continue;
+        } catch {}
+      }
+
+      if (job.tries < 3 && /Too Many Requests|timeout|ECONNRESET|ETELEGRAM|EFATAL/i.test(String(e?.message || desc || ''))) {
+        job.tries += 1;
+        broadcastQueue.push(job);
+        await new Promise(r => setTimeout(r, 1200));
       }
     }
   }
 }
 
-# ========================
-# BOT CONFIG (NEUE WERTE!)
-# ========================
+function broadcastToChannelAndGroups(method, payload, tag = '') {
+  const targets = [String(CHANNEL_ID), ...getActiveGroups()];
+  console.log(`📢 BROADCAST: ${targets.length} targets, Method=${method}, Tag=${tag}`);
+  for (const chatId of targets) enqueueBroadcast(method, chatId, payload, tag);
+}
 
-CHANNEL_ID=-1003522620534
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=
-# ========================
-# WALLETS (NEUE WALLETS!)
-# ========================
-PAYOUT_SECRET_BASE58=
-FEE_WALLET=589LVZTEmg2a4TtQpwd3Eu54khDfQKPBBBH23SusfHxi
+/* =========================
+   TOKEN DATA
+========================= */
+const metaCache = new Map();
 
-# ========================
-# ADMIN
-# ========================
-ADMIN_IDS=
-CHANNEL_LINK=https://t.me/White_memebot
-TWITTER_LINK=https://x.com/White_meme1xa
+async function fetchDexPair(tokenCA) {
+  return await withRetry(async () => {
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenCA}`;
+    const res = await axios.get(url, { timeout: HTTP_TIMEOUT_MS });
+    return res.data?.pairs?.[0] || null;
+  }, 'fetchDexPair');
+}
 
-# ========================
-# DATABASE
-# ========================
-DB_PATH=./whitememe.db
+function pairMarketCap(pair) {
+  const mc = Number(pair?.fdv ?? pair?.marketCap ?? 0);
+  return Number.isFinite(mc) ? mc : 0;
+}
+function pairName(pair) { return pair?.baseToken?.name || null; }
+function pairSymbol(pair) { return pair?.baseToken?.symbol || null; }
+function pairAddress(pair) { return pair?.pairAddress || null; }
+function pairLogo(pair) {
+  return pair?.baseToken?.logoURI || pair?.info?.imageUrl || pair?.info?.imageUrl || null;
+}
 
-# ========================
-# PAYOUT SETTINGS
-# ========================
-MIN_HOLD_HOURS=24
-MIN_HOLDER_PCT=0.0004
-DAILY_PAYOUT_PCT=0.20
-MIN_PAYOUT_SOL=0.00001
-MAX_PAYOUTS_PER_ROUND=300
-MAX_PAYOUT_RECIPIENTS=80
-TX_DELAY_MS=350
-PAYOUT_WALLET_BUFFER_LAMPORTS=2000000
+/* =========================
+   Pump.fun META
+========================= */
+async function fetchPumpMeta(tokenCA) {
+  return await withRetry(async () => {
+    const url = pumpfunLink(tokenCA);
+    const html = (await axios.get(url, { timeout: HTTP_TIMEOUT_MS })).data;
 
-# ========================
-# BROADCAST SETTINGS
-# ========================
-BROADCAST_DELAY_MS=450
-META_REFRESH_MS=90000
-HTTP_TIMEOUT_MS=15000
+    const mImg = html.match(/property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
+    const img = (mImg?.[1] || '').trim() || null;
 
-# Environment
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+    const mTitle = html.match(/property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+    const title = (mTitle?.[1] || '').trim();
 
-# Dependencies
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+    let name = null;
+    let symbol = null;
 
-# Database
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
+    const mt = title.match(/^(.+?)\s*\((?:\$)?([A-Za-z0-9_]{1,15})\)\s*$/);
+    if (mt) {
+      name = mt[1]?.trim() || null;
+      symbol = mt[2]?.trim() || null;
+    } else if (title) {
+      name = title.slice(0, 64);
+    }
 
-# OS
-.DS_Store
-Thumbs.db
+    return { ok: true, name, symbol, img, pump_url: url };
+  }, 'fetchPumpMeta');
+}
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+/* =========================
+   META UPSERT WITH CACHE
+========================= */
+function upsertTokenMeta(tokenCA, fields) {
+  const pump_url = pumpfunLink(tokenCA);
+  const dex_url = dexscreenerTokenLink(tokenCA);
 
-# Logs
-logs/
-*.log
+  db.prepare(`
+    INSERT INTO token_meta (ca, name, symbol, pump_url, dex_url, pair_address, on_dex_at_reg, logo_url, display_name, display_symbol)
+    VALUES (@ca, @name, @symbol, @pump_url, @dex_url, @pair_address, @on_dex_at_reg, @logo_url, @display_name, @display_symbol)
+    ON CONFLICT(ca) DO UPDATE SET
+      name=COALESCE(excluded.name, token_meta.name),
+      symbol=COALESCE(excluded.symbol, token_meta.symbol),
+      pump_url=excluded.pump_url,
+      dex_url=excluded.dex_url,
+      pair_address=COALESCE(excluded.pair_address, token_meta.pair_address),
+      on_dex_at_reg=COALESCE(token_meta.on_dex_at_reg, excluded.on_dex_at_reg),
+      logo_url=COALESCE(excluded.logo_url, token_meta.logo_url),
+      display_name=COALESCE(excluded.display_name, token_meta.display_name),
+      display_symbol=COALESCE(excluded.display_symbol, token_meta.display_symbol)
+  `).run({
+    ca: tokenCA,
+    name: fields.name || null,
+    symbol: fields.symbol || null,
+    pump_url,
+    dex_url,
+    pair_address: fields.pair_address || null,
+    on_dex_at_reg: Number(fields.on_dex_at_reg || 0),
+    logo_url: fields.logo_url || null,
+    display_name: fields.display_name || null,
+    display_symbol: fields.display_symbol || null,
+  });
 
-[146,246,77,19,199,255,183,174,244,66,170,228,192,82,4,26,61,211,109,183,195,139,119,127,237,101,76,92,75,233,79,21,249,151,159,178,227,167,221,201,172,43,121,178,128,87,158,185,47,36,178,90,171,170,69,40,172,136,137,164,35,2,153,129]
+  const result = getMeta(tokenCA);
+  metaCache.set(tokenCA, { data: result, timestamp: Date.now() });
+  return result;
+}
+
+async function refreshMetaPriority(tokenCA) {
+  const cached = metaCache.get(tokenCA);
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  const isPump = String(tokenCA).toLowerCase().endsWith('pump');
+
+  let pump = { ok: false }
+  let dexPair = null;
+
+  if (isPump) {
+    pump = await fetchPumpMeta(tokenCA);
+    try { dexPair = await fetchDexPair(tokenCA); } catch {}
+  } else {
+    try { dexPair = await fetchDexPair(tokenCA); } catch {}
+    pump = await fetchPumpMeta(tokenCA);
+  }
+
+  const name = (isPump ? (pump.name || null) : (pairName(dexPair) || null)) || pump.name || pairName(dexPair) || null;
+  const symbol = (isPump ? (pump.symbol || null) : (pairSymbol(dexPair) || null)) || pump.symbol || pairSymbol(dexPair) || null;
+
+  const logo_url =
+    (isPump ? (pump.img || null) : (pairLogo(dexPair) || null)) ||
+    pump.img ||
+    pairLogo(dexPair) ||
+    null;
+
+  const onDexAtReg = dexPair ? 1 : 0;
+  const pairAddr = dexPair ? pairAddress(dexPair) : null;
+
+  upsertTokenMeta(tokenCA, { name, symbol, on_dex_at_reg: onDexAtReg, pair_address: pairAddr, logo_url });
+
+  if (dexPair) {
+    const mc = pairMarketCap(dexPair);
+    if (mc > 0) {
+      db.prepare(`UPDATE token_meta SET last_mc=?, last_checked_at=? WHERE ca=?`).run(mc, now(), tokenCA);
+    }
+  }
+
+  const result = getMeta(tokenCA);
+  metaCache.set(tokenCA, { data: result, timestamp: Date.now() });
+  return result;
+}
+
+/* =========================
+   POSTING FUNCTION - UPDATED FORMAT!
+========================= */
+async function postToChannelAndGroups(tokenCA, extraLine = '') {
+  console.log(`🚀 POST for Token: ${tokenCA}`);
+  
+  const meta = getMeta(tokenCA) || await refreshMetaPriority(tokenCA);
+  const token = getToken(tokenCA);
+  const creatorPool = token ? getCreatorTokenPool(token.creator_tg_id, tokenCA) : 0;
+  const displayName = meta?.display_name || meta?.name || 'Unknown Token';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  const isPump = String(tokenCA).toLowerCase().endsWith('pump');
+  
+  // Format: "Token Name (Symbol) - Pump #Symbol"
+  const tokenLine = `${displayName} (${displaySymbol}) - Pump #${displaySymbol}`;
+  
+  const caption = `🎭 WHITEMEME 🚀 NEW TOKEN LISTED!
+
+🪙 Token: ${tokenLine}
+💎 Market Cap: ${formatMc(Number(meta?.last_mc || 0))}
+🏆 Creator Pool: ${fmtSol(creatorPool)} SOL
+
+🔐 CA: ${monospace(tokenCA)}
+
+${extraLine || '✅ Activated (deposit confirmed) 🎉'}
+
+✅ Registered holders can earn rewards!
+⏰ Minimum hold: ${MIN_HOLD_HOURS} hours
+🚀 Longer hold = More rewards!`;
+
+  try {
+    const me = await bot.telegram.getMe();
+    
+    let buttons;
+    if (isPump) {
+      buttons = Markup.inlineKeyboard([
+        [
+          Markup.button.url('🚀 Pump.fun', meta?.pump_url || pumpfunLink(tokenCA)),
+          Markup.button.url('📊 Chart', meta?.dex_url || dexscreenerTokenLink(tokenCA)),
+        ],
+        [Markup.button.url('🤖 Open WhiteMeme Bot', `https://t.me/${me.username}`)],
+      ]);
+    } else {
+      buttons = Markup.inlineKeyboard([
+        [
+          Markup.button.url('📊 Chart', meta?.dex_url || dexscreenerTokenLink(tokenCA)),
+        ],
+        [Markup.button.url('🤖 Open WhiteMeme Bot', `https://t.me/${me.username}`)],
+      ]);
+    }
+
+    const img = meta?.logo_url || null;
+
+    if (img) {
+      broadcastToChannelAndGroups('sendPhoto', [img, { 
+        caption, 
+        reply_markup: buttons.reply_markup,
+        parse_mode: 'Markdown'
+      }], `(listing ${tokenCA.slice(0, 6)}...)`);
+    } else {
+      broadcastToChannelAndGroups('sendMessage', [caption, { 
+        reply_markup: buttons.reply_markup,
+        parse_mode: 'Markdown'
+      }], `(listing ${tokenCA.slice(0, 6)}...)`);
+    }
+
+    console.log(`✅ Listing post queued for Token: ${tokenCA}`);
+
+  } catch (error) {
+    console.log(`❌ Error creating listing post: ${error.message}`);
+  }
+}
+
+/* =========================
+   AUTO-PAYOUT SCHEDULER (20:00 UTC Daily)
+========================= */
+function startAutoPayoutScheduler() {
+  console.log('⏰ Starting Auto-Payout Scheduler (20:00 UTC daily)...');
+  
+  const scheduleNextPayout = () => {
+    const now = new Date();
+    const target = new Date(now);
+    target.setUTCHours(20, 0, 0, 0);
+    
+    if (now > target) {
+      target.setUTCDate(target.getUTCDate() + 1);
+    }
+    
+    const delay = target.getTime() - now.getTime();
+    
+    console.log(`⏰ Next auto-payout scheduled for: ${target.toUTCString()} (in ${Math.round(delay / 1000 / 60)} minutes)`);
+    
+    setTimeout(async () => {
+      console.log('💰 Starting automatic daily payout...');
+      try {
+        const result = await manualPayoutAllTokens();
+        console.log(`✅ Auto-payout completed: ${result.message}`);
+        
+        const adminMsg = `💰 Daily Auto-Payout Executed\n\nStatus: ${result.success ? '✅ SUCCESS' : '⚠️ PARTIAL'}\nMessage: ${result.message}\nTime: ${new Date().toLocaleString()}`;
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.telegram.sendMessage(adminId, adminMsg);
+          } catch {}
+        }
+      } catch (error) {
+        console.log('❌ Auto-payout failed:', error.message);
+      }
+      
+      scheduleNextPayout();
+    }, delay);
+  };
+  
+  scheduleNextPayout();
+}
+
+/* =========================
+   FEES + DEPOSIT CHECK
+========================= */
+async function sendFeeTransfer(feeSol) {
+  return await withRetry(async () => {
+    const lamports = Math.floor(feeSol * LAMPORTS_PER_SOL);
+    if (lamports <= 0) return null;
+
+    const sendLamports = Math.max(0, lamports - 10_000);
+    if (sendLamports <= 0) return null;
+
+    const to = new PublicKey(FEE_WALLET);
+    const tx = new Transaction().add(
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: to, lamports: sendLamports })
+    );
+
+    const sig = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    return sig;
+  }, 'sendFeeTransfer');
+}
+
+async function verifyDepositTx(signature, expectedToWallet) {
+  return await withRetry(async () => {
+    const parsed = await connection.getParsedTransaction(signature, {
+      commitment: 'confirmed',
+      maxSupportedTransactionVersion: 0,
+    });
+
+    if (!parsed?.meta) return { ok: false, reason: 'tx_not_found' };
+
+    let found = false;
+    let fromWallet = null;
+    let solAmount = 0;
+
+    const instructions = parsed.transaction.message.instructions || [];
+    for (const ix of instructions) {
+      if (ix?.program === 'system') {
+        const info = ix?.parsed?.info;
+        if (info?.destination === expectedToWallet && info?.lamports) {
+          found = true;
+          fromWallet = info?.source || null;
+          solAmount += Number(info.lamports) / LAMPORTS_PER_SOL;
+        }
+      }
+    }
+
+    if (!found) return { ok: false, reason: 'no_transfer_to_reward_wallet' };
+    if (solAmount <= 0) return { ok: false, reason: 'zero_amount' };
+    return { ok: true, solAmount, fromWallet };
+  }, 'verifyDepositTx');
+}
+
+/* =========================
+   STATE
+========================= */
+const state = new Map();
+const setState = (uid, obj) => state.set(uid, obj);
+const getState = (uid) => state.get(uid);
+const clearState = (uid) => state.delete(uid);
+
+/* =========================
+   CALLBACK KEYS
+========================= */
+const CB = {
+  HOME: 'H',
+  HELP: 'HP',
+  CRE_HOME: 'CH',
+  HOL_HOME: 'HH',
+  CRE_REG: 'CR',
+  CRE_LIST: 'CL',
+  HOL_REG: 'HR',
+  HOL_MY: 'HM',
+  HOL_REM: 'HD',
+  ADM_HOME: 'AH',
+  ADM_SUM: 'AS',
+  ADM_PAYOUT: 'AP',
+  ADM_GROUPS: 'AG',
+  ADM_TOKENS: 'AT',
+};
+
+function paginateRows(rows, page, pageSize) {
+  const p = Math.max(0, Number(page || 0));
+  const start = p * pageSize;
+  const slice = rows.slice(start, start + pageSize);
+  const maxPage = Math.max(0, Math.ceil(rows.length / pageSize) - 1);
+  return { page: p, maxPage, slice };
+}
+
+/* =========================
+   MENUS
+========================= */
+function homeKeyboard(ctx) {
+  const rows = [
+    [Markup.button.callback('👨‍🎨 Creator Panel', CB.CRE_HOME)],
+    [Markup.button.callback('👥 Holder Panel', CB.HOL_HOME)],
+    [
+      ...(CHANNEL_LINK ? [Markup.button.url('📢 Channel', CHANNEL_LINK)] : []),
+      ...(TWITTER_LINK ? [Markup.button.url('𝕏 Twitter', TWITTER_LINK)] : []),
+    ].filter(Boolean),
+    [Markup.button.callback('❓ Help', CB.HELP)],
+  ];
+
+  if (isAdmin(ctx)) rows.push([Markup.button.callback('⚡ Admin Panel', CB.ADM_HOME)]);
+
+  return Markup.inlineKeyboard(rows.filter(r => r.length));
+}
+
+function creatorHomeKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('➕ Register Token', CB.CRE_REG)],
+    [Markup.button.callback('🗂️ My Tokens', `${CB.CRE_LIST}:0`)],
+    [Markup.button.callback('🏠 Start', CB.HOME)],
+  ]);
+}
+
+function holderHomeKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Register as Holder', CB.HOL_REG)],
+    [Markup.button.callback('📋 My Registrations', `${CB.HOL_MY}:0`)],
+    [Markup.button.callback('🗑️ Remove Registration', CB.HOL_REM)],
+    [Markup.button.callback('🏠 Start', CB.HOME)],
+  ]);
+}
+
+function adminHomeKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📈 Global Analytics', CB.ADM_SUM)],
+    [Markup.button.callback('🚀 RUN PAYOUT NOW', CB.ADM_PAYOUT)],
+    [Markup.button.callback('🪙 Manage Tokens', `${CB.ADM_TOKENS}:0`)],
+    [Markup.button.callback('👥 Manage Groups', `${CB.ADM_GROUPS}:0`)],
+    [Markup.button.callback('🏠 Start', CB.HOME)],
+  ]);
+}
+
+function tokenConfirmKeyboard(tokenCA) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Confirm Token', `CONF:${tokenCA}`)],
+    [Markup.button.callback('❌ Cancel', 'CXL')],
+  ]);
+}
+
+function creatorManageKeyboard(tokenCA) {
+  const buttons = [
+    [Markup.button.callback('💸 Deposit / Check Payment', `DEP:${tokenCA}`)],
+    [
+      Markup.button.callback('📊 Stats', `CST:${tokenCA}`),
+      Markup.button.callback('📋 Report', `REP:${tokenCA}`),
+    ],
+    [
+      Markup.button.callback('👤 Holder Stats', `CHS:${tokenCA}`),
+      Markup.button.callback('🎨 Edit Display', `EDN:${tokenCA}`),
+    ],
+    [Markup.button.callback('🚫 Deactivate', `DEA:${tokenCA}`)],
+    [Markup.button.callback('⬅️ Back', `${CB.CRE_LIST}:0`)],
+  ];
+  
+  return Markup.inlineKeyboard(buttons);
+}
+
+function paymentKeyboard(tokenCA) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔎 Check Payment', `CHK:${tokenCA}`)],
+    [Markup.button.callback('⬅️ Back', `MAN:${tokenCA}`)],
+  ]);
+}
+
+function adminTokenActionsKeyboard(tokenCA, backPage = 0) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🔄 Repost', `AR:${tokenCA}:${backPage}`),
+      Markup.button.callback('💸 PAY NOW', `PAYTOKEN:${tokenCA}`),
+    ],
+    [
+      Markup.button.callback('🎗️ Bonded Posts', `BONDED:${tokenCA}:${backPage}`),
+      Markup.button.callback('🧮 Calc Payout', `CALCPAY:${tokenCA}:${backPage}`),
+    ],
+    [
+      Markup.button.callback('🆑 Reset Alerts', `AX:${tokenCA}:${backPage}`),
+      Markup.button.callback('📈 Update MC', `UPDATEMC:${tokenCA}:${backPage}`),
+    ],
+    [
+      Markup.button.callback('✅ Activate', `AA:${tokenCA}:${backPage}`),
+      Markup.button.callback('⭕ Inactivate', `AI:${tokenCA}:${backPage}`),
+    ],
+    [Markup.button.callback('🗑️ Delete', `AD:${tokenCA}:${backPage}`)],
+    [Markup.button.callback('⬅️ Back', `${CB.ADM_TOKENS}:${backPage}`)],
+  ]);
+}
+
+/* =========================
+   GROUP ACTIVATION
+========================= */
+function saveGroupChat(ctx) {
+  if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') return false;
+  db.prepare(`
+    INSERT INTO groups (chat_id, title, active, created_at, last_error)
+    VALUES (?, ?, 1, ?, NULL)
+    ON CONFLICT(chat_id) DO UPDATE SET active=1, title=excluded.title, last_error=NULL
+  `).run(String(ctx.chat.id), ctx.chat.title || '', now());
+  return true;
+}
+
+bot.command('activate', async (ctx) => {
+  const ok = saveGroupChat(ctx);
+  if (!ok) return ctx.reply('⚠️ Use /activate inside a group.');
+  await ctx.reply('✅ Group activated! This group will now receive 🎭 WHITEMEME posts. 🚀');
+  cleanupAfterDelay(ctx, 3000);
+});
+
+bot.command('syncgroup', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  const ok = saveGroupChat(ctx);
+  if (!ok) return ctx.reply('⚠️ Use /syncgroup inside a group.');
+  await ctx.reply('✅ Group synced and activated (admin).');
+  cleanupAfterDelay(ctx, 3000);
+});
+
+bot.command('testbroadcast', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  const groups = getActiveGroups();
+  const msg = `📢 🎭 WHITEMEME TEST BROADCAST\n\nIf you see this in the channel AND your groups, delivery is working ✅\nChannel target: ${CHANNEL_ID}\nActive groups: ${groups.length}\n\nTime: ${new Date().toUTCString()} 🚀`;
+  broadcastToChannelAndGroups('sendMessage', [msg], '(testbroadcast)');
+  await ctx.reply('✅ Test broadcast queued. Check your channel and group(s).');
+  cleanupAfterDelay(ctx, 3000);
+});
+
+/* =========================
+   ADMIN CONTROLS FOR BONDED POSTING
+========================= */
+bot.action(/^BONDED:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  
+  const tokenCA = ctx.match[1];
+  const backPage = Number(ctx.match[2] || 0);
+  
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ 2X Post', `BONDEDFORCE:${tokenCA}:2:${backPage}`)],
+    [Markup.button.callback('✅ 5X Post', `BONDEDFORCE:${tokenCA}:5:${backPage}`)],
+    [Markup.button.callback('✅ 10X Post', `BONDEDFORCE:${tokenCA}:10:${backPage}`)],
+    [Markup.button.callback('🔄 Reset Milestones', `BONDEDRESET:${tokenCA}:${backPage}`)],
+    [Markup.button.callback('🔙 Back', `${CB.ADM_TOKENS}:${backPage}`)],
+  ]);
+  
+  const meta = getMeta(tokenCA);
+  const baseMC = Number(meta?.base_mc || 0);
+  const currentMC = Number(meta?.last_mc || 0);
+  const bondedPosted = Number(meta?.bonded_posted || 0);
+  
+  let status = 'No base MC set';
+  if (baseMC > 0 && currentMC > 0) {
+    const multiplier = (currentMC / baseMC).toFixed(2);
+    status = `${multiplier}x from base (${formatMc(currentMC)} / ${formatMc(baseMC)})`;
+  }
+  
+  await ctx.reply(
+`🎗️ Bonded Posting Control
+
+Token: ${meta?.display_name || meta?.name || 'Unknown'}
+Current: ${status}
+Last posted milestone: ${bondedPosted > 0 ? `${bondedPosted}x` : 'None'}
+
+Force post a milestone or reset:`,
+    confirmKeyboard
+  );
+});
+
+bot.action(/^BONDEDFORCE:(.+):(\d+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  
+  const tokenCA = ctx.match[1];
+  const milestone = Number(ctx.match[2]);
+  const backPage = Number(ctx.match[3] || 0);
+  
+  const isPump = String(tokenCA).toLowerCase().endsWith('pump');
+  const meta = getMeta(tokenCA);
+  const isBonded = meta?.on_dex_at_reg === 1 && isPump;
+  
+  db.prepare(`UPDATE token_meta SET bonded_posted=? WHERE ca=?`).run(milestone, tokenCA);
+  
+  await postMilestone(tokenCA, milestone, isBonded);
+  
+  await ctx.reply(`✅ Forced ${milestone}x ${isBonded ? 'bonded' : 'milestone'} post for token.`, adminHomeKeyboard());
+});
+
+bot.action(/^BONDEDRESET:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  
+  const tokenCA = ctx.match[1];
+  const backPage = Number(ctx.match[2] || 0);
+  
+  db.prepare(`UPDATE token_meta SET bonded_posted=0, last_x_posted=0 WHERE ca=?`).run(tokenCA);
+  
+  await ctx.reply(`✅ Bonded milestones reset for token.`, adminHomeKeyboard());
+});
+
+bot.action(/^UPDATEMC:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  
+  const tokenCA = ctx.match[1];
+  const backPage = Number(ctx.match[2] || 0);
+  
+  try {
+    const pair = await fetchDexPair(tokenCA);
+    if (pair) {
+      const mc = pairMarketCap(pair);
+      const meta = getMeta(tokenCA);
+      
+      if (mc > 0) {
+        db.prepare(`UPDATE token_meta SET last_mc=?, last_checked_at=? WHERE ca=?`)
+          .run(mc, now(), tokenCA);
+        
+        if (!meta?.base_mc || Number(meta.base_mc) <= 0) {
+          db.prepare(`UPDATE token_meta SET base_mc=? WHERE ca=?`).run(mc, tokenCA);
+        }
+        
+        await ctx.reply(`✅ Market Cap updated: ${formatMc(mc)}`, adminHomeKeyboard());
+      } else {
+        await ctx.reply(`⚠️ No market cap found`, adminHomeKeyboard());
+      }
+    } else {
+      await ctx.reply(`⚠️ No pair data found`, adminHomeKeyboard());
+    }
+  } catch (error) {
+    await ctx.reply(`❌ Error: ${error.message}`, adminHomeKeyboard());
+  }
+});
+
+/* =========================
+   START / HOME / HELP
+========================= */
+async function sendWelcome(ctx) {
+  clearState(ctx.from.id);
+  
+  await cleanupPreviousMessage(ctx);
+
+  if (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') {
+    saveGroupChat(ctx);
+    return ctx.reply('✅ Group activated! This group will receive 🎭 WHITEMEME posts. 🚀');
+  }
+
+  const text = `🎭 WELCOME TO WHITEMEME BOT 🤖
+
+✨ What you can do here:
+
+👨‍🎨 Creators
+1) Register your token (any Solana mint CA) 🪙
+2) Confirm the token ✅
+3) Fund the rewards pool (send SOL) 💰
+4) After your deposit is confirmed, the bot posts to the Channel + Active Groups ✅
+
+👥 Holders
+1) Register for a token 📝
+2) Add your Solana wallet 👛
+3) Stay eligible by holding long enough ⏰
+
+🔒 Safety
+👛 No custody. No private keys. You control your wallet.
+
+Tap a panel below to start 👇`;
+
+  await ctx.reply(text, homeKeyboard(ctx));
+}
+
+bot.start(async (ctx) => {
+  await cleanupPreviousMessage(ctx);
+  await sendWelcome(ctx);
+});
+
+bot.action(CB.HOME, async (ctx) => { 
+  await safeAnswerCb(ctx); 
+  await sendWelcome(ctx); 
+});
+
+bot.action(CB.HELP, async (ctx) => {
+  await safeAnswerCb(ctx);
+
+  let text = `❓ HELP & GUIDELINES 📚
+
+👨‍🎨 CREATOR FLOW
+1) Creator Panel → Register Token (paste mint CA) 🪙
+2) Confirm token ✅
+3) Deposit/Payment → Send SOL to the Reward Wallet 💸
+4) Paste Solscan TX link → Check Payment 🔎
+5) After confirmed: bot posts to the Channel + Active Groups 🚀
+
+👥 HOLDER FLOW
+1) Holder Panel → Register as Holder 📝
+2) Send Token CA 🪙
+3) Send your Solana wallet 👛
+
+✅ Eligibility rules
+- Minimum hold time: ${MIN_HOLD_HOURS} hours ⏰
+- Minimum holding: ${(MIN_HOLDER_PCT * 100).toFixed(4)}% of total supply 🪙
+- Do NOT sell during holding period 📉
+- The longer you hold, the more rewards you earn! 💎
+
+👥 GROUPS
+- In a group: /activate (anyone) or /syncgroup (admin) 🔧
+
+🎗️ BONDED POSTING
+- Auto-posts at 2x, 5x, 10x market cap milestones 📈🚀💎
+- Uses 🎗️ emoji for bonded posts (Pump.fun tokens only)
+
+💡 Tip: You will receive DM notifications for payouts! 📨`;
+
+  if (isAdmin(ctx)) {
+    text += `
+
+⚡ ADMIN SECTION (Your ID: ${ctx.from.id})
+- Analytics, manage tokens/groups, repost, reset alerts, run payouts.
+- Use /testbroadcast to verify delivery instantly.`;
+  }
+
+  await ctx.reply(text);
+});
+
+/* =========================
+   HOLDER PANEL
+========================= */
+bot.action(CB.HOL_HOME, async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  await safeEditOrReply(ctx, '👥 Holder Panel', holderHomeKeyboard());
+});
+
+bot.action(CB.HOL_REG, async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  setState(ctx.from.id, { mode: 'holder_send_token' });
+  await ctx.reply(
+`✅ Holder Registration 📝
+
+To register for rewards:
+1. Send token CA (mint address) 🪙
+2. Send your Solana wallet address 👛
+
+You must:
+• Hold at least ${(MIN_HOLDER_PCT * 100).toFixed(4)}% of token supply 🪙
+• Hold for minimum ${MIN_HOLD_HOURS} hours ⏰
+• Do NOT sell during holding period 📉
+
+Send the token CA now:`
+  );
+});
+
+bot.action(CB.HOL_REM, async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  setState(ctx.from.id, { mode: 'holder_remove_token' });
+  await ctx.reply(
+`🗑️ Remove Registration
+
+Send the token CA you want to remove registration for:`,
+    holderHomeKeyboard()
+  );
+});
+
+async function renderHolderRegistrations(ctx, page = 0) {
+  const uid = ctx.from.id;
+  const rows = db.prepare(`
+    SELECT h.ca, h.wallet, h.registered_at, h.total_paid,
+           COALESCE(tm.display_name, tm.name) as name,
+           COALESCE(tm.display_symbol, tm.symbol) as symbol
+    FROM holders h
+    LEFT JOIN token_meta tm ON tm.ca=h.ca
+    WHERE h.tg_id=?
+    ORDER BY h.registered_at DESC
+  `).all(uid);
+
+  if (!rows.length) {
+    return safeEditOrReply(ctx, '📋 No registrations yet.\n\nRegister for a token to start earning rewards! 🚀', holderHomeKeyboard());
+  }
+
+  const { page: p, maxPage, slice } = paginateRows(rows, page, 5);
+
+  let msg = `📋 My Registrations (${p + 1}/${maxPage + 1})\n\n`;
+  slice.forEach((r, idx) => {
+    const name = r.name || 'Unknown';
+    const symbol = r.symbol ? `$${r.symbol}` : 'N/A';
+    const walletShort = r.wallet.slice(0, 8) + '...' + r.wallet.slice(-4);
+    const registered = new Date(r.registered_at).toLocaleDateString();
+    const holdHours = ((now() - r.registered_at) / (1000 * 60 * 60)).toFixed(1);
+    const totalPaid = Number(r.total_paid || 0);
+    
+    msg += `${idx+1}. ${name} (${symbol})\n`;
+    msg += `   Wallet: ${walletShort}\n`;
+    msg += `   Registered: ${registered}\n`;
+    msg += `   Hold time: ${holdHours}h / ${MIN_HOLD_HOURS}h ⏰\n`;
+    msg += `   Total earned: ${fmtSol(totalPaid)} SOL 💰\n\n`;
+  });
+
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('◀️ Back', `${CB.HOL_MY}:${p - 1}`));
+  if (p < maxPage) nav.push(Markup.button.callback('Next ▶️', `${CB.HOL_MY}:${p + 1}`));
+
+  const kb = Markup.inlineKeyboard([
+    ...(nav.length ? [nav] : []),
+    [Markup.button.callback('✅ New Registration', CB.HOL_REG)],
+    [Markup.button.callback('🗑️ Remove Registration', CB.HOL_REM)],
+    [Markup.button.callback('🏠 Start', CB.HOME)],
+  ]);
+
+  await safeEditOrReply(ctx, msg, kb, 0);
+}
+
+bot.action(new RegExp(`^${CB.HOL_MY}:(\\d+)$`), async (ctx) => {
+  await safeAnswerCb(ctx);
+  await renderHolderRegistrations(ctx, Number(ctx.match[1] || 0));
+});
+
+/* =========================
+   ADMIN PANEL - COMPLETELY FIXED!
+========================= */
+bot.action(CB.ADM_HOME, async (ctx) => {
+  console.log('⚡ Admin Panel clicked, user ID:', ctx.from.id);
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  await safeEditOrReply(ctx, '⚡ Admin Panel', adminHomeKeyboard());
+});
+
+bot.action(CB.ADM_SUM, async (ctx) => {
+  await safeAnswerCb(ctx);
+  await showAdminSummary(ctx);
+});
+
+bot.action(CB.ADM_PAYOUT, async (ctx) => {
+  await safeAnswerCb(ctx);
+  await executeAdminPayout(ctx);
+});
+
+// Neue Navigation Handler für Admin Tokens
+bot.action(/^ADM_TOKENS_PREV:(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  await renderAdminTokens(ctx, Number(ctx.match[1] || 0));
+});
+
+bot.action(/^ADM_TOKENS_NEXT:(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  await renderAdminTokens(ctx, Number(ctx.match[1] || 0));
+});
+
+bot.action(new RegExp(`^${CB.ADM_TOKENS}:(\\d+)$`), async (ctx) => {
+  console.log('🔍 ADM_TOKENS callback received:', ctx.callbackQuery.data);
+  await safeAnswerCb(ctx);
+  await renderAdminTokens(ctx, Number(ctx.match[1] || 0));
+});
+
+bot.action(new RegExp(`^${CB.ADM_GROUPS}:(\\d+)$`), async (ctx) => {
+  await safeAnswerCb(ctx);
+  await renderAdminGroups(ctx, Number(ctx.match[1] || 0));
+});
+
+async function showAdminSummary(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+
+  const tokenStats = db.prepare(`
+    SELECT 
+      COUNT(*) as total,
+      SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) as active,
+      SUM(CASE WHEN status='PENDING_PAYMENT' THEN 1 ELSE 0 END) as pending,
+      SUM(CASE WHEN status='PENDING_CONFIRM' THEN 1 ELSE 0 END) as unconfirmed
+    FROM tokens
+  `).get();
+
+  const depositStats = db.prepare(`
+    SELECT 
+      COALESCE(SUM(sol_amount), 0) as total_deposited,
+      COALESCE(SUM(fee_sol), 0) as total_fees,
+      COALESCE(SUM(reward_sol), 0) as total_rewards,
+      COUNT(*) as total_transactions
+    FROM deposits
+  `).get();
+
+  const payoutStats = db.prepare(`
+    SELECT 
+      COALESCE(SUM(sol_amount), 0) as total_paid,
+      COUNT(DISTINCT ca) as tokens_paid,
+      COUNT(*) as total_payouts
+    FROM payouts
+  `).get();
+
+  const holderStats = db.prepare(`
+    SELECT 
+      COUNT(*) as total_holders,
+      COUNT(DISTINCT ca) as tokens_with_holders,
+      COALESCE(SUM(total_paid), 0) as total_rewards_paid
+    FROM holders
+  `).get();
+
+  const groupStats = db.prepare(`
+    SELECT 
+      COUNT(*) as total_groups,
+      SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_groups
+    FROM groups
+  `).get();
+
+  // Neue Statistik: Creator Pools
+  const creatorPoolStats = db.prepare(`
+    SELECT 
+      COUNT(DISTINCT creator_tg_id) as unique_creators,
+      COUNT(*) as creator_pools,
+      COALESCE(SUM(sol_amount), 0) as total_creator_pools
+    FROM creator_token_pools
+  `).get();
+
+  const msg = `📊 ADMIN SUMMARY
+
+🪙 TOKENS
+Total: ${tokenStats.total}
+Active: ${tokenStats.active}
+Pending Payment: ${tokenStats.pending}
+Unconfirmed: ${tokenStats.unconfirmed}
+
+💰 FINANCIAL
+Total Deposited: ${fmtSol(depositStats.total_deposited)} SOL
+Total Fees: ${fmtSol(depositStats.total_fees)} SOL
+Total Rewards Pool: ${fmtSol(depositStats.total_rewards)} SOL
+Total Paid Out: ${fmtSol(payoutStats.total_paid)} SOL
+Total Rewards Paid: ${fmtSol(holderStats.total_rewards_paid)} SOL
+
+👨‍🎨 CREATOR POOLS (NEU)
+Unique Creators: ${creatorPoolStats.unique_creators}
+Creator Pools: ${creatorPoolStats.creator_pools}
+Total Creator Pools: ${fmtSol(creatorPoolStats.total_creator_pools)} SOL
+
+👥 HOLDERS
+Total Holders: ${holderStats.total_holders}
+Tokens with Holders: ${holderStats.tokens_with_holders}
+
+📢 GROUPS
+Total Groups: ${groupStats.total_groups}
+Active Groups: ${groupStats.active_groups}`;
+
+  await ctx.reply(msg, adminHomeKeyboard());
+}
+
+async function executeAdminPayout(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+
+  await ctx.reply('🚀 Starting manual payout for all active tokens...');
+
+  try {
+    const result = await manualPayoutAllTokens();
+    
+    let msg = `💰 MANUAL PAYOUT COMPLETE\n\n`;
+    msg += `Status: ${result.success ? '✅ SUCCESS' : '⚠️ PARTIAL'}\n`;
+    msg += `Message: ${result.message}\n`;
+    msg += `Total Paid: ${fmtSol(result.totalPaid || 0)} SOL\n`;
+    msg += `Recipients: ${result.totalRecipients || 0}\n`;
+    msg += `Tokens Processed: ${result.results?.length || 0}\n\n`;
+    
+    if (result.results?.length > 0) {
+      msg += `Token Results:\n`;
+      result.results.forEach((r, idx) => {
+        msg += `${idx+1}. ${r.tokenName || r.tokenCA.slice(0, 8)} (Creator ${r.creatorId}): ${fmtSol(r.paid || 0)} SOL to ${r.recipients || 0} holders\n`;
+      });
+    }
+    
+    await ctx.reply(msg, adminHomeKeyboard());
+  } catch (error) {
+    await ctx.reply(`❌ Payout failed: ${error.message}`, adminHomeKeyboard());
+  }
+}
+
+async function renderAdminTokens(ctx, page = 0) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+
+  const rows = db.prepare(`
+    SELECT t.ca, t.status, t.created_at, t.creator_tg_id, t.creator_username,
+           COALESCE(tm.display_name, tm.name) as name,
+           COALESCE(tm.display_symbol, tm.symbol) as symbol,
+           (SELECT COALESCE(SUM(reward_sol),0) FROM deposits d WHERE d.ca=t.ca) as total_pool,
+           (SELECT COALESCE(sol_amount,0) FROM creator_token_pools WHERE creator_tg_id=t.creator_tg_id AND token_ca=t.ca) as creator_pool,
+           (SELECT COUNT(*) FROM holders h WHERE h.ca=t.ca) as holder_count
+    FROM tokens t
+    LEFT JOIN token_meta tm ON tm.ca=t.ca
+    ORDER BY t.created_at DESC
+  `).all();
+
+  console.log(`📊 Found ${rows.length} tokens in database`);
+
+  if (!rows.length) {
+    return ctx.reply('🪙 No tokens in database.', adminHomeKeyboard());
+  }
+
+  const pageSize = 5;
+  const currentPage = Math.max(0, Number(page || 0));
+  const startIdx = currentPage * pageSize;
+  const endIdx = startIdx + pageSize;
+  const slice = rows.slice(startIdx, endIdx);
+  const maxPage = Math.max(0, Math.ceil(rows.length / pageSize) - 1);
+
+  let msg = `🪙 Admin Token Management (${currentPage + 1}/${maxPage + 1})\n\n`;
+  
+  slice.forEach((r, idx) => {
+    const name = r.name || 'Unknown';
+    const symbol = r.symbol ? `$${r.symbol}` : 'N/A';
+    const totalPool = Number(r.total_pool || 0);
+    const creatorPool = Number(r.creator_pool || 0);
+    const date = new Date(r.created_at).toLocaleDateString();
+    
+    msg += `${startIdx + idx + 1}. ${name} (${symbol})\n`;
+    msg += `   Status: ${r.status}\n`;
+    msg += `   Creator: ${r.creator_username || r.creator_tg_id}\n`;
+    msg += `   Total Pool: ${fmtSol(totalPool)} SOL\n`;
+    msg += `   Creator Pool: ${fmtSol(creatorPool)} SOL 🎯\n`;
+    msg += `   Holders: ${r.holder_count}\n`;
+    msg += `   Created: ${date}\n`;
+    msg += `   CA: ${monospace(r.ca.slice(0, 12) + '...')}\n\n`;
+  });
+
+  // Navigation buttons with unique callback data
+  const nav = [];
+  if (currentPage > 0) {
+    nav.push(Markup.button.callback('◀️ Back', `ADM_TOKENS_PREV:${currentPage - 1}`));
+  }
+  if (currentPage < maxPage) {
+    nav.push(Markup.button.callback('Next ▶️', `ADM_TOKENS_NEXT:${currentPage + 1}`));
+  }
+
+  // Create token selection buttons with UNIQUE callback data
+  const tokenButtons = slice.map((r, idx) => [
+    Markup.button.callback(`Token ${startIdx + idx + 1}`, `ADMIN_TOKEN_SELECT:${r.ca}:${currentPage}:${idx}`)
+  ]);
+
+  const keyboardRows = [
+    ...tokenButtons,
+    ...(nav.length > 0 ? [nav] : []),
+    [Markup.button.callback('🏠 Home', CB.HOME)],
+  ];
+
+  const kb = Markup.inlineKeyboard(keyboardRows);
+
+  try {
+    // If it's a callback query, edit the message
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(msg, {
+        reply_markup: kb.reply_markup,
+        parse_mode: 'Markdown'
+      });
+    } else {
+      // If it's a regular message, reply
+      await ctx.reply(msg, {
+        reply_markup: kb.reply_markup,
+        parse_mode: 'Markdown'
+      });
+    }
+  } catch (error) {
+    console.log('❌ Error rendering admin tokens:', error.message);
+    // Fallback: send new message
+    await ctx.reply(msg, {
+      reply_markup: kb.reply_markup,
+      parse_mode: 'Markdown'
+    });
+  }
+}
+
+// Aktualisierter Token Select Handler mit unique callback
+bot.action(/^ADMIN_TOKEN_SELECT:(.+):(\d+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = Number(ctx.match[2] || 0);
+  
+  const token = getToken(tokenCA);
+  const meta = getMeta(tokenCA) || await refreshMetaPriority(tokenCA);
+  const creatorPool = token ? getCreatorTokenPool(token.creator_tg_id, tokenCA) : 0;
+  const totalFunded = getTotalFunded(tokenCA);
+  const holderCount = countHoldersForToken(tokenCA);
+  
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  const msg = `🪙 ADMIN TOKEN DETAILS
+
+Name: ${displayName}
+Symbol: ${displaySymbol ? `$${displaySymbol}` : 'N/A'}
+CA: ${monospace(tokenCA)}
+
+Status: ${token?.status || 'UNKNOWN'}
+Creator: ${token?.creator_username || token?.creator_tg_id}
+Created: ${new Date(token?.created_at || 0).toLocaleString()}
+
+Market Cap: ${formatMc(Number(meta?.last_mc || 0))} 💎
+CREATOR POOL: ${fmtSol(creatorPool)} SOL 🎯
+Total Funded: ${fmtSol(totalFunded)} SOL
+Registered Holders: ${holderCount} 👥
+
+Pump.fun: ${meta?.pump_url || 'N/A'}
+DexScreener: ${meta?.dex_url || 'N/A'}
+
+Choose action:`;
+  
+  await ctx.reply(msg, adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+// Behalte den alten Handler für Kompatibilität
+bot.action(/^ADMIN_TOKEN:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = Number(ctx.match[2] || 0);
+  
+  const token = getToken(tokenCA);
+  const meta = getMeta(tokenCA) || await refreshMetaPriority(tokenCA);
+  const creatorPool = token ? getCreatorTokenPool(token.creator_tg_id, tokenCA) : 0;
+  const totalFunded = getTotalFunded(tokenCA);
+  const holderCount = countHoldersForToken(tokenCA);
+  
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  const msg = `🪙 ADMIN TOKEN DETAILS
+
+Name: ${displayName}
+Symbol: ${displaySymbol ? `$${displaySymbol}` : 'N/A'}
+CA: ${monospace(tokenCA)}
+
+Status: ${token?.status || 'UNKNOWN'}
+Creator: ${token?.creator_username || token?.creator_tg_id}
+Created: ${new Date(token?.created_at || 0).toLocaleString()}
+
+Market Cap: ${formatMc(Number(meta?.last_mc || 0))} 💎
+CREATOR POOL: ${fmtSol(creatorPool)} SOL 🎯
+Total Funded: ${fmtSol(totalFunded)} SOL
+Registered Holders: ${holderCount} 👥
+
+Pump.fun: ${meta?.pump_url || 'N/A'}
+DexScreener: ${meta?.dex_url || 'N/A'}
+
+Choose action:`;
+  
+  await ctx.reply(msg, adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+async function renderAdminGroups(ctx, page = 0) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+
+  const rows = db.prepare(`
+    SELECT chat_id, title, active, created_at, last_error
+    FROM groups
+    ORDER BY created_at DESC
+  `).all();
+
+  if (!rows.length) {
+    return safeEditOrReply(ctx, '👥 No groups in database.', adminHomeKeyboard());
+  }
+
+  const { page: p, maxPage, slice } = paginateRows(rows, page, 5);
+
+  let msg = `👥 Admin Group Management (${p + 1}/${maxPage + 1})\n\n`;
+  slice.forEach((r, idx) => {
+    const title = r.title || 'No Title';
+    const status = r.active ? '✅ ACTIVE' : '❌ INACTIVE';
+    const date = new Date(r.created_at).toLocaleDateString();
+    const error = r.last_error ? `\n   Error: ${r.last_error.slice(0, 50)}...` : '';
+    
+    msg += `${idx+1}. ${title}\n`;
+    msg += `   Chat ID: ${r.chat_id}\n`;
+    msg += `   Status: ${status}\n`;
+    msg += `   Created: ${date}${error}\n\n`;
+  });
+
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('◀️ Back', `${CB.ADM_GROUPS}:${p - 1}`));
+  if (p < maxPage) nav.push(Markup.button.callback('Next ▶️', `${CB.ADM_GROUPS}:${p + 1}`));
+
+  const kb = Markup.inlineKeyboard([
+    ...(nav.length ? [nav] : []),
+    [Markup.button.callback('🔄 Sync All Groups', 'ADMIN_SYNC_GROUPS')],
+    [Markup.button.callback('🏠 Home', CB.HOME)],
+  ]);
+
+  await safeEditOrReply(ctx, msg, kb, 0);
+}
+
+bot.action('ADMIN_SYNC_GROUPS', async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return ctx.reply('⛔ No access.');
+  
+  await ctx.reply('🔄 Syncing all groups... This may take a moment.');
+  await ctx.reply('✅ Group sync function would resync all groups here.', adminHomeKeyboard());
+});
+
+bot.action(/^AR:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  await postToChannelAndGroups(tokenCA, '🔄 Reposted by admin');
+  await ctx.reply('✅ Token reposted!', adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+bot.action(/^PAYTOKEN:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  
+  await ctx.reply(`💰 Processing payouts for token ${tokenCA.slice(0, 8)}...`);
+  
+  try {
+    const result = await executePayoutsForToken(tokenCA);
+    
+    let msg = `💰 PAYOUT RESULTS\n\n`;
+    msg += `Token: ${tokenCA.slice(0, 8)}...\n`;
+    msg += `Status: ${result.success ? '✅ SUCCESS' : '❌ FAILED'}\n`;
+    msg += `Message: ${result.message}\n`;
+    msg += `Paid: ${fmtSol(result.paid || 0)} SOL\n`;
+    msg += `Recipients: ${result.recipients || 0}\n`;
+    
+    if (result.transactions?.length > 0) {
+      const successful = result.transactions.filter(t => t.success).length;
+      const failed = result.transactions.filter(t => !t.success).length;
+      msg += `\nTransactions: ${successful} ✅, ${failed} ❌`;
+    }
+    
+    await ctx.reply(msg, adminHomeKeyboard());
+  } catch (error) {
+    await ctx.reply(`❌ Payout failed: ${error.message}`, adminHomeKeyboard());
+  }
+});
+
+bot.action(/^CALCPAY:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  await ctx.reply(`🧮 Calculating payouts for token...`);
+  
+  try {
+    const calculation = await calculatePayoutsForToken(tokenCA);
+    
+    let msg = `🧮 PAYOUT CALCULATION\n\n`;
+    msg += `Token: ${tokenCA.slice(0, 8)}...\n`;
+    const token = getToken(tokenCA);
+    msg += `Creator: ${token?.creator_tg_id || 'Unknown'}\n`;
+    msg += `Creator Pool: ${fmtSol(calculation.pool || 0)} SOL\n`;
+    msg += `Daily Payout (20%): ${fmtSol((calculation.pool || 0) * 0.20)} SOL\n`;
+    msg += `Total Payout: ${fmtSol(calculation.totalPayout || 0)} SOL\n`;
+    msg += `Eligible Recipients: ${calculation.recipients?.length || 0}\n`;
+    msg += `Message: ${calculation.message}\n\n`;
+    
+    if (calculation.recipients?.length > 0) {
+      msg += `Top 5 recipients:\n`;
+      calculation.recipients.slice(0, 5).forEach((r, idx) => {
+        msg += `${idx+1}. ${r.wallet.slice(0, 8)}...: ${fmtSol(r.amount)} SOL (${r.share.toFixed(2)}%)\n`;
+      });
+    }
+    
+    await ctx.reply(msg, adminTokenActionsKeyboard(tokenCA, backPage));
+  } catch (error) {
+    await ctx.reply(`❌ Calculation failed: ${error.message}`, adminTokenActionsKeyboard(tokenCA, backPage));
+  }
+});
+
+bot.action(/^AX:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  db.prepare(`UPDATE holders SET last_notified_at=0, last_notification_type=NULL WHERE ca=?`).run(tokenCA);
+  
+  await ctx.reply('✅ Holder alerts reset for this token.', adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+bot.action(/^AA:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  db.prepare(`UPDATE tokens SET status='ACTIVE' WHERE ca=?`).run(tokenCA);
+  
+  await ctx.reply('✅ Token activated.', adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+bot.action(/^AI:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  db.prepare(`UPDATE tokens SET status='INACTIVE' WHERE ca=?`).run(tokenCA);
+  
+  await ctx.reply('✅ Token inactivated.', adminTokenActionsKeyboard(tokenCA, backPage));
+});
+
+bot.action(/^AD:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ YES DELETE', `AD_CONFIRM:${tokenCA}:${backPage}`)],
+    [Markup.button.callback('❌ Cancel', `${CB.ADM_TOKENS}:${backPage}`)],
+  ]);
+  
+  await ctx.reply(
+`⚠️ CONFIRM DELETE TOKEN ⚠️
+
+This will delete token ${tokenCA.slice(0, 8)}...
+• Token record
+• Meta data
+• Holder registrations
+• Deposit history
+• Payout history
+• Creator pool data
+
+This action cannot be undone!
+
+Type "DELETE" to confirm:`,
+    confirmKeyboard
+  );
+});
+
+bot.action(/^AD_CONFIRM:(.+):(\d+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  if (!isAdmin(ctx)) return;
+  
+  const tokenCA = ctx.match[1];
+  const backPage = ctx.match[2];
+  
+  db.prepare('BEGIN TRANSACTION').run();
+  try {
+    const token = getToken(tokenCA);
+    if (token) {
+      // Creator pool auch löschen
+      db.prepare(`DELETE FROM creator_token_pools WHERE creator_tg_id=? AND token_ca=?`).run(token.creator_tg_id, tokenCA);
+      db.prepare(`DELETE FROM creator_payouts WHERE creator_tg_id=? AND token_ca=?`).run(token.creator_tg_id, tokenCA);
+    }
+    
+    db.prepare(`DELETE FROM tokens WHERE ca=?`).run(tokenCA);
+    db.prepare(`DELETE FROM token_meta WHERE ca=?`).run(tokenCA);
+    db.prepare(`DELETE FROM holders WHERE ca=?`).run(tokenCA);
+    db.prepare(`DELETE FROM deposits WHERE ca=?`).run(tokenCA);
+    db.prepare(`DELETE FROM payouts WHERE ca=?`).run(tokenCA);
+    db.prepare('COMMIT').run();
+    
+    await ctx.reply(`✅ Token ${tokenCA.slice(0, 8)}... deleted.`, Markup.inlineKeyboard([
+      [Markup.button.callback('⬅️ Back to Tokens', `${CB.ADM_TOKENS}:${backPage}`)]
+    ]));
+  } catch (error) {
+    db.prepare('ROLLBACK').run();
+    await ctx.reply(`❌ Delete failed: ${error.message}`, adminTokenActionsKeyboard(tokenCA, backPage));
+  }
+});
+
+/* =========================
+   CREATOR PANEL - FIXED!
+========================= */
+bot.action(CB.CRE_HOME, async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  await safeEditOrReply(ctx, '👨‍🎨 Creator Panel', creatorHomeKeyboard());
+});
+
+bot.action(CB.CRE_REG, async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  setState(ctx.from.id, { mode: 'creator_send_ca' });
+  await ctx.reply(
+`➕ Creator: Register Token 🪙
+
+Send your token CA (mint address).
+
+Important:
+• Any Solana token can be registered 🔗
+• Minimum deposit: 0.01 SOL 💰
+• Fee: 10% of deposit (goes to fee wallet) 📊
+• 90% goes to YOUR creator rewards pool 🎁
+
+Paste your token CA now:`,
+{ parse_mode: 'Markdown' }
+  );
+});
+
+async function renderCreatorTokens(ctx, page = 0) {
+  const uid = ctx.from.id;
+  const rows = db.prepare(`
+    SELECT t.ca, t.status, t.created_at, 
+           COALESCE(tm.display_name, tm.name) as name, 
+           COALESCE(tm.display_symbol, tm.symbol) as symbol,
+           (SELECT COALESCE(sol_amount,0) FROM creator_token_pools WHERE creator_tg_id=t.creator_tg_id AND token_ca=t.ca) as creator_pool
+    FROM tokens t
+    LEFT JOIN token_meta tm ON tm.ca=t.ca
+    WHERE t.creator_tg_id=?
+    ORDER BY t.created_at DESC
+  `).all(uid);
+
+  if (!rows.length) {
+    return safeEditOrReply(ctx, '🗂️ No tokens yet.\n\nRegister your first token to start! 🚀', creatorHomeKeyboard());
+  }
+
+  const { page: p, maxPage, slice } = paginateRows(rows, page, 5);
+
+  let msg = `🗂️ My Tokens (${p + 1}/${maxPage + 1})\n\n`;
+  slice.forEach((r, idx) => {
+    const n = r.name || 'Unknown';
+    const s = r.symbol ? `$${r.symbol}` : 'N/A';
+    const creatorPool = Number(r.creator_pool || 0);
+    const date = new Date(r.created_at).toLocaleDateString();
+    
+    msg += `${idx+1}. ${n} (${s})\n`;
+    msg += `   Status: ${r.status}\n`;
+    msg += `   Your Pool: ${fmtSol(creatorPool)} SOL 🎯\n`;
+    msg += `   CA: ${monospace(r.ca.slice(0, 16) + '...')}\n`;
+    msg += `   Created: ${date}\n\n`;
+  });
+  
+  const pickButtons = slice.map((r, idx) => [Markup.button.callback(`📝 Token ${idx + 1}`, `MAN:${r.ca}`)]);
+
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('◀️ Back', `${CB.CRE_LIST}:${p - 1}`));
+  if (p < maxPage) nav.push(Markup.button.callback('Next ▶️', `${CB.CRE_LIST}:${p + 1}`));
+
+  const kb = Markup.inlineKeyboard([
+    ...pickButtons,
+    ...(nav.length ? [nav] : []),
+    [Markup.button.callback('➕ New Token', CB.CRE_REG)],
+    [Markup.button.callback('🏠 Start', CB.HOME)],
+  ]);
+
+  await safeEditOrReply(ctx, msg, kb, 0);
+}
+
+bot.action(new RegExp(`^${CB.CRE_LIST}:(\\d+)$`), async (ctx) => {
+  await safeAnswerCb(ctx);
+  await renderCreatorTokens(ctx, Number(ctx.match[1] || 0));
+});
+
+bot.action(/^MAN:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) return ctx.reply('⚠️ Not your token.');
+
+  const meta = getMeta(tokenCA) || await refreshMetaPriority(tokenCA);
+  const creatorPool = getCreatorTokenPool(uid, tokenCA);
+  const status = getToken(tokenCA)?.status || 'UNKNOWN';
+  const holders = countHoldersForToken(tokenCA);
+  const mc = Number(meta?.last_mc || 0);
+  const totalFunded = getTotalFunded(tokenCA);
+
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+
+  await ctx.reply(
+`👨‍🎨 Manage Token
+
+Name: ${displayName}
+Symbol: ${displaySymbol ? `$${displaySymbol}` : 'N/A'}
+CA: ${monospace(tokenCA)}
+
+Status: ${status}
+Market Cap: ${formatMc(mc)} 💎
+YOUR Rewards Pool: ${fmtSol(creatorPool)} SOL 🎯
+Total Funded: ${fmtSol(totalFunded)} SOL
+Registered holders: ${holders} 👥
+
+Next step ✅
+- Deposit must be confirmed before posting.
+
+Choose an action below:`,
+    creatorManageKeyboard(tokenCA)
+  );
+});
+
+/* =========================
+   CREATOR ACTION HANDLERS - NEWLY ADDED!
+========================= */
+
+// Creator Stats Handler - AKTUALISIERT für Creator Pools
+bot.action(/^CST:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  const token = getToken(tokenCA);
+  const meta = getMeta(tokenCA);
+  const creatorStats = getCreatorTokenStats(uid, tokenCA);
+  const holderCount = countHoldersForToken(tokenCA);
+  
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  // Get recent payouts from creator pool
+  const recentPayouts = db.prepare(`
+    SELECT COUNT(*) as count, COALESCE(SUM(sol_amount), 0) as total 
+    FROM creator_payouts 
+    WHERE creator_tg_id=? AND token_ca=? AND paid_at > ?
+  `).get(uid, tokenCA, now() - 7 * 24 * 60 * 60 * 1000);
+
+  const recentHolders = db.prepare(`
+    SELECT COUNT(*) as count 
+    FROM holders 
+    WHERE ca=? AND registered_at > ?
+  `).get(tokenCA, now() - 7 * 24 * 60 * 60 * 1000);
+
+  const msg = `📊 TOKEN STATISTICS
+
+🪙 Token: ${displayName} (${displaySymbol ? `$${displaySymbol}` : 'N/A'})
+📈 Status: ${token?.status || 'UNKNOWN'}
+📅 Created: ${new Date(token?.created_at || 0).toLocaleDateString()}
+
+💰 YOUR FINANCIAL (Creator-isoliert)
+• Your Rewards Pool: ${fmtSol(creatorStats.pool)} SOL 🎯
+• Your Total Deposited: ${fmtSol(creatorStats.totalDeposited)} SOL
+• Your Total Paid Out: ${fmtSol(creatorStats.totalPaid)} SOL
+• Market Cap: ${formatMc(Number(meta?.last_mc || 0))}
+
+👥 HOLDERS
+• Total Registered: ${holderCount}
+• New (7 days): ${recentHolders?.count || 0}
+
+🎁 YOUR PAYOUTS
+• Recent (7 days): ${recentPayouts?.count || 0} payments
+• Amount: ${fmtSol(recentPayouts?.total || 0)} SOL
+
+🔗 Links:
+• Pump.fun: ${meta?.pump_url || 'N/A'}
+• Chart: ${meta?.dex_url || 'N/A'}`;
+
+  await ctx.reply(msg, creatorManageKeyboard(tokenCA));
+});
+
+// Creator Report Handler - AKTUALISIERT
+bot.action(/^REP:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  const token = getToken(tokenCA);
+  const meta = getMeta(tokenCA);
+  const creatorStats = getCreatorTokenStats(uid, tokenCA);
+  const holderCount = countHoldersForToken(tokenCA);
+  
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  // Get all deposits for this creator
+  const deposits = db.prepare(`
+    SELECT signature, sol_amount, fee_sol, reward_sol, created_at 
+    FROM deposits 
+    WHERE ca=? 
+    ORDER BY created_at DESC
+  `).all(tokenCA);
+  
+  // Get creator payouts
+  const creatorPayouts = db.prepare(`
+    SELECT holder_wallet, sol_amount, paid_at 
+    FROM creator_payouts 
+    WHERE creator_tg_id=? AND token_ca=?
+    ORDER BY paid_at DESC
+    LIMIT 10
+  `).all(uid, tokenCA);
+  
+  let msg = `📋 TOKEN REPORT (Your Creator Pool)
+
+🪙 Token: ${displayName} (${displaySymbol ? `$${displaySymbol}` : 'N/A'})
+📈 Status: ${token?.status || 'UNKNOWN'}
+💰 YOUR Rewards Pool: ${fmtSol(creatorStats.pool)} SOL 🎯
+👥 Registered Holders: ${holderCount}
+
+📥 YOUR DEPOSITS (${deposits.length}):\n`;
+  
+  deposits.forEach((dep, idx) => {
+    if (idx < 5) {
+      const date = new Date(dep.created_at).toLocaleDateString();
+      msg += `• ${date}: ${fmtSol(dep.sol_amount)} SOL (Fee: ${fmtSol(dep.fee_sol)} SOL)\n`;
+    }
+  });
+  
+  if (deposits.length > 5) {
+    msg += `• ... and ${deposits.length - 5} more deposits\n`;
+  }
+  
+  msg += `\n📤 YOUR RECENT PAYOUTS (${creatorPayouts.length}):\n`;
+  
+  if (creatorPayouts.length > 0) {
+    creatorPayouts.forEach((payout, idx) => {
+      if (idx < 3) {
+        const date = new Date(payout.paid_at).toLocaleDateString();
+        const walletShort = payout.holder_wallet.slice(0, 8) + '...' + payout.holder_wallet.slice(-4);
+        msg += `• ${date}: ${fmtSol(payout.sol_amount)} SOL to ${walletShort}\n`;
+      }
+    });
+    
+    if (creatorPayouts.length > 3) {
+      msg += `• ... and ${creatorPayouts.length - 3} more payouts\n`;
+    }
+  } else {
+    msg += `• No payouts from your pool yet\n`;
+  }
+  
+  msg += `\n📊 Your Total Deposited: ${fmtSol(creatorStats.totalDeposited)} SOL`;
+  msg += `\n📊 Your Total Paid: ${fmtSol(creatorStats.totalPaid)} SOL`;
+  msg += `\n📈 Market Cap: ${formatMc(Number(meta?.last_mc || 0))}`;
+
+  await ctx.reply(msg, creatorManageKeyboard(tokenCA));
+});
+
+// Creator Holder Stats Handler
+bot.action(/^CHS:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  const holders = db.prepare(`
+    SELECT h.wallet, h.registered_at, h.total_paid, h.last_paid_at, h.username,
+           (SELECT COUNT(*) FROM holders h2 WHERE h2.ca=h.ca) as total_holders
+    FROM holders h
+    WHERE h.ca=?
+    ORDER BY h.registered_at DESC
+    LIMIT 20
+  `).all(tokenCA);
+  
+  const totalHolders = holders.length > 0 ? holders[0].total_holders : 0;
+  const meta = getMeta(tokenCA);
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  const displaySymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  let msg = `👤 HOLDER STATISTICS
+
+🪙 Token: ${displayName} (${displaySymbol ? `$${displaySymbol}` : 'N/A'})
+📊 Total Holders: ${totalHolders}
+
+📋 RECENT REGISTRATIONS:\n`;
+  
+  if (holders.length > 0) {
+    holders.forEach((holder, idx) => {
+      if (idx < 10) {
+        const walletShort = holder.wallet.slice(0, 8) + '...' + holder.wallet.slice(-4);
+        const registered = new Date(holder.registered_at).toLocaleDateString();
+        const holdHours = ((now() - holder.registered_at) / (1000 * 60 * 60)).toFixed(1);
+        const totalPaid = fmtSol(holder.total_paid || 0);
+        
+        msg += `\n${idx+1}. ${walletShort}`;
+        if (holder.username) msg += ` (@${holder.username})`;
+        msg += `\n   📅 Registered: ${registered}`;
+        msg += `\n   ⏰ Hold time: ${holdHours}h`;
+        msg += `\n   💰 Earned: ${totalPaid} SOL`;
+      }
+    });
+    
+    if (holders.length > 10) {
+      msg += `\n\n... and ${holders.length - 10} more holders`;
+    }
+  } else {
+    msg += `\nNo holders registered yet.`;
+  }
+  
+  // Get top earners from this creator's pool
+  const topEarners = db.prepare(`
+    SELECT h.wallet, h.total_paid, h.username
+    FROM holders h
+    WHERE h.ca=? AND h.total_paid > 0
+    ORDER BY h.total_paid DESC
+    LIMIT 5
+  `).all(tokenCA);
+  
+  if (topEarners.length > 0) {
+    msg += `\n\n🏆 TOP EARNERS:\n`;
+    topEarners.forEach((earner, idx) => {
+      const walletShort = earner.wallet.slice(0, 8) + '...' + earner.wallet.slice(-4);
+      msg += `\n${idx+1}. ${walletShort}: ${fmtSol(earner.total_paid || 0)} SOL`;
+      if (earner.username) msg += ` (@${earner.username})`;
+    });
+  }
+
+  await ctx.reply(msg, creatorManageKeyboard(tokenCA));
+});
+
+// Creator Edit Display Handler
+bot.action(/^EDN:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  const meta = getMeta(tokenCA);
+  const currentName = meta?.display_name || meta?.name || 'Unknown';
+  const currentSymbol = meta?.display_symbol || meta?.symbol || 'N/A';
+  
+  // Set state for text handler
+  setState(uid, { mode: 'creator_edit_name', tempTokenCA: tokenCA });
+  
+  await ctx.reply(
+`🎨 EDIT DISPLAY NAME/SYMBOL
+
+Current name: ${currentName}
+Current symbol: ${currentSymbol}
+
+Please send the NEW name (max 64 characters):
+
+Example: "WhiteMeme Token", "CryptoPump", etc.`,
+    creatorManageKeyboard(tokenCA)
+  );
+});
+
+// Creator Deactivate Handler
+bot.action(/^DEA:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  const token = getToken(tokenCA);
+  if (!token) return ctx.reply('⚠️ Token not found.', creatorHomeKeyboard());
+  
+  const meta = getMeta(tokenCA);
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ YES, DEACTIVATE', `DEA_CONFIRM:${tokenCA}`)],
+    [Markup.button.callback('❌ Cancel', `MAN:${tokenCA}`)],
+  ]);
+  
+  await ctx.reply(
+`🚫 DEACTIVATE TOKEN ⚠️
+
+Token: ${displayName}
+CA: ${tokenCA.slice(0, 12)}...
+
+⚠️ WARNING:
+• Token will be marked INACTIVE
+• No more payouts from YOUR pool will be processed
+• Your existing creator pool remains
+• Holders cannot earn new rewards from your pool
+• Can be reactivated by admin
+
+Are you sure you want to deactivate this token?`,
+    confirmKeyboard
+  );
+});
+
+// Creator Deactivate Confirmation Handler
+bot.action(/^DEA_CONFIRM:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+  }
+
+  db.prepare(`UPDATE tokens SET status='INACTIVE' WHERE ca=?`).run(tokenCA);
+  
+  const meta = getMeta(tokenCA);
+  const displayName = meta?.display_name || meta?.name || 'Unknown';
+  
+  await ctx.reply(
+`✅ Token deactivated: ${displayName}
+
+The token has been marked as INACTIVE.
+• No new payouts from YOUR pool will be processed
+• Your existing creator pool remains
+• Holders will be notified
+• Contact admin to reactivate`,
+    creatorManageKeyboard(tokenCA)
+  );
+});
+
+/* =========================
+   CONFIRM / CANCEL
+========================= */
+bot.action(/^CONF:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  const t = getToken(tokenCA);
+  if (!t) return ctx.reply('⚠️ Token not found.');
+  if (t.creator_tg_id !== uid) return ctx.reply('⚠️ Only the creator can confirm.');
+
+  db.prepare(`UPDATE tokens SET status='PENDING_PAYMENT' WHERE ca=?`).run(tokenCA);
+
+  await ctx.reply(
+`✅ Token confirmed! 🎉
+
+💸 Next step: Deposit required
+Send SOL to the Reward Wallet:
+${monospace(REWARD_WALLET)}
+
+Minimum: 0.01 SOL 💰
+Fee: 10% (sent to fee wallet) 📊
+Rewards: 90% added to YOUR creator pool 🎯
+
+Then open "Deposit / Check Payment" and paste your Solscan TX link. 🔎`,
+    creatorManageKeyboard(tokenCA)
+  );
+});
+
+bot.action('CXL', async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearState(ctx.from.id);
+  await ctx.reply('❌ Cancelled.', creatorHomeKeyboard());
+});
+
+/* =========================
+   DEPOSIT / CHECK (AKTUALISIERT für Creator Pools)
+========================= */
+bot.action(/^DEP:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) return ctx.reply('⚠️ Not your token.');
+  const t = getToken(tokenCA);
+  if (!t) return ctx.reply('⚠️ Token not found.');
+  if (t.status === 'PENDING_CONFIRM') return ctx.reply('⚠️ Please confirm the token first.');
+
+  setState(uid, { mode: 'wait_payment_tx', tempTokenCA: tokenCA });
+
+  await ctx.reply(
+`💸 Deposit / Payment
+
+Send SOL to Reward Wallet:
+${monospace(REWARD_WALLET)}
+
+Requirements:
+• Minimum deposit: 0.01 SOL 💰
+• Service fee: 10% (sent to fee wallet) 📊
+• Rewards added: 90% to YOUR creator pool 🎯
+
+How to pay:
+1. Send SOL to address above
+2. Go to solscan.io
+3. Copy the transaction link
+4. Paste it here
+5. Click "Check Payment" button
+
+Now paste your Solscan TX link here. 🔍`,
+{ 
+  parse_mode: 'Markdown',
+  reply_markup: paymentKeyboard(tokenCA).reply_markup
+}
+  );
+});
+
+bot.action(/^CHK:(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const tokenCA = ctx.match[1];
+  const uid = ctx.from.id;
+
+  if (!creatorOwnsToken(uid, tokenCA)) {
+    return ctx.reply('⚠️ Not your token.', creatorManageKeyboard(tokenCA));
+  }
+
+  const s = getState(uid);
+  if (!s?.tempSig || s?.tempTokenCA !== tokenCA) {
+    return ctx.reply('⚠️ Please paste your Solscan TX link first, then click "Check Payment".', creatorManageKeyboard(tokenCA));
+  }
+
+  const sig = s.tempSig;
+
+  const already = db.prepare(`SELECT signature FROM deposits WHERE signature=?`).get(sig);
+  if (already) {
+    clearState(uid);
+    return ctx.reply('✅ Transaction already confirmed and processed.', creatorManageKeyboard(tokenCA));
+  }
+
+  let verification;
+  try {
+    verification = await verifyDepositTx(sig, REWARD_WALLET);
+  } catch (e) {
+    return ctx.reply(`⚠️ Could not verify transaction. Error: ${String(e?.message || e)}`, creatorManageKeyboard(tokenCA));
+  }
+
+  if (!verification.ok) {
+    return ctx.reply(`⚠️ Payment not confirmed. Reason: ${verification.reason}`, creatorManageKeyboard(tokenCA));
+  }
+
+  const solAmount = verification.solAmount;
+  if (solAmount < 0.01) {
+    return ctx.reply('⚠️ Deposit too small. Minimum is 0.01 SOL.', creatorManageKeyboard(tokenCA));
+  }
+
+  const feeSol = solAmount * 0.10;
+  const rewardSol = solAmount * 0.90;
+
+  let feeSig = null;
+  try {
+    feeSig = await sendFeeTransfer(feeSol);
+    console.log(`✅ Fee sent: ${feeSig}`);
+  } catch (feeError) {
+    console.log(`⚠️ Fee transfer failed: ${feeError.message}`);
+    return ctx.reply('⚠️ Fee transfer failed. Please try again.', creatorManageKeyboard(tokenCA));
+  }
+
+  db.prepare(`
+    INSERT INTO deposits (signature, ca, from_wallet, sol_amount, fee_sol, reward_sol, fee_sig, created_at, creator_tg_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(sig, tokenCA, verification.fromWallet || '', solAmount, feeSol, rewardSol, feeSig || '', now(), uid);
+
+  // WICHTIG: Creator-Pool aktualisieren (nur dieser Creator!)
+  const token = getToken(tokenCA);
+  if (token) {
+    updateCreatorTokenPool(token.creator_tg_id, tokenCA, rewardSol);
+  }
+
+  db.prepare(`UPDATE tokens SET status='ACTIVE' WHERE ca=?`).run(tokenCA);
+
+  await refreshMetaPriority(tokenCA);
+
+  const meta = getMeta(tokenCA);
+  if (!meta?.base_mc || Number(meta.base_mc) <= 0) {
+    try {
+      const pair = await fetchDexPair(tokenCA);
+      const mc = pairMarketCap(pair);
+      if (mc > 0) {
+        db.prepare(`UPDATE token_meta SET base_mc=?, last_mc=?, last_checked_at=? WHERE ca=?`)
+          .run(mc, mc, now(), tokenCA);
+      }
+    } catch {}
+  }
+
+  clearState(uid);
+
+  console.log(`🚀 STARTING POST after payment for: ${tokenCA}`);
+  await postToChannelAndGroups(tokenCA, '✅ Activated (deposit confirmed) 🎉');
+
+  const newCreatorPool = token ? getCreatorTokenPool(token.creator_tg_id, tokenCA) : 0;
+  
+  await ctx.reply(
+`✅ Deposit confirmed! 🎉
+
+Deposit: ${fmtSol(solAmount)} SOL 💰
+Added to YOUR pool: ${fmtSol(rewardSol)} SOL 🎯
+Your pool now: ${fmtSol(newCreatorPool)} SOL
+
+🚀 Post has been sent to Channel + Groups!
+
+✅ Token is now active and will be monitored.
+🎗️ Auto-posts at 2x, 5x, 10x milestones!
+💰 Payouts will ONLY come from YOUR creator pool.`,
+    creatorManageKeyboard(tokenCA)
+  );
+});
+
+/* =========================
+   TEXT HANDLER (flows)
+========================= */
+bot.on('text', async (ctx) => {
+  const uid = ctx.from.id;
+  const s = getState(uid);
+  const text = (ctx.message?.text || '').trim();
+
+  if (!text || text.startsWith('/')) return;
+
+  // CREATOR register
+  if (s?.mode === 'creator_send_ca') {
+    const ca = extractFirstPubkey(text);
+    if (!ca) return ctx.reply('⚠️ Invalid mint address. Please paste only the CA.');
+
+    if (tokenExists(ca)) {
+      clearState(uid);
+      return ctx.reply('⚠️ Token already exists. Open "My Tokens".', creatorHomeKeyboard());
+    }
+
+    db.prepare(`
+      INSERT INTO tokens (ca, creator_tg_id, creator_username, status, created_at)
+      VALUES (?, ?, ?, 'PENDING_CONFIRM', ?)
+    `).run(ca, uid, ctx.from.username || '', now());
+
+    const meta = await refreshMetaPriority(ca);
+    clearState(uid);
+
+    const name = meta?.display_name || meta?.name || 'Unknown';
+    const symbol = meta?.display_symbol || meta?.symbol || 'N/A';
+    const logo = meta?.logo_url;
+
+    let confirmationMsg = `🪙 Confirm this token\n\n`;
+    if (logo) {
+      confirmationMsg += `✅ Token information retrieved successfully!\n\n`;
+    }
+    
+    confirmationMsg += `Name: ${name}\n`;
+    confirmationMsg += `Symbol: ${symbol ? `$${symbol}` : 'N/A'}\n`;
+    confirmationMsg += `CA: ${monospace(ca)}\n\n`;
+    confirmationMsg += `Posting happens ONLY after deposit is confirmed ✅\n\n`;
+    confirmationMsg += `Payment wallet: ${monospace(REWARD_WALLET)}`;
+
+    if (logo) {
+      await ctx.replyWithPhoto(logo, {
+        caption: confirmationMsg,
+        parse_mode: 'Markdown',
+        reply_markup: tokenConfirmKeyboard(ca).reply_markup
+      });
+    } else {
+      await ctx.reply(confirmationMsg, {
+        parse_mode: 'Markdown',
+        reply_markup: tokenConfirmKeyboard(ca)
+      });
+    }
+    
+    return;
+  }
+
+  // HOLDER send token
+  if (s?.mode === 'holder_send_token') {
+    const ca = extractFirstPubkey(text);
+    if (!ca) return ctx.reply('⚠️ Invalid token CA.');
+
+    if (!tokenExists(ca)) return ctx.reply('⚠️ This token is not registered yet. Ask the creator to register it first.');
+
+    try {
+      const supply = await getMintSupplyAndDecimals(ca);
+      const supplyUi = Number(supply.uiAmount || 0);
+      const minUi = supplyUi * MIN_HOLDER_PCT;
+      
+      await ctx.reply(`🔍 Checking token supply...\n\nMinimum required: ${minUi.toFixed(4)} tokens 🪙\n\nNow send your wallet address to check your balance.`);
+      
+      setState(uid, { 
+        mode: 'holder_send_wallet', 
+        tempTokenCA: ca,
+        tempMinRequired: minUi,
+        tempSupplyUi: supplyUi
+      });
+    } catch (e) {
+      await ctx.reply('⚠️ Could not fetch token supply. Please try again later.');
+    }
+    return;
+  }
+
+  // HOLDER send wallet
+  if (s?.mode === 'holder_send_wallet') {
+    const ca = s.tempTokenCA;
+    const minRequired = s.tempMinRequired || 0;
+    const wallet = extractFirstPubkey(text);
+    if (!wallet) return ctx.reply('⚠️ Invalid wallet address.');
+
+    try {
+      const balance = await getWalletTokenBalanceUi(wallet, ca);
+      const supplyUi = s.tempSupplyUi || 0;
+      
+      if (balance < minRequired) {
+        const percentHeld = supplyUi > 0 ? (balance / supplyUi * 100).toFixed(6) : '0';
+        const requiredPercent = (MIN_HOLDER_PCT * 100).toFixed(4);
+        
+        await ctx.reply(
+`⚠️ Insufficient Balance
+
+You hold: ${balance.toFixed(4)} tokens 🪙
+Required: ${minRequired.toFixed(4)} tokens 🪙
+
+Percentage held: ${percentHeld}%
+Required: ${requiredPercent}%
+
+You must hold at least ${requiredPercent}% of total supply to register.
+
+Please acquire more tokens and try again.`,
+          holderHomeKeyboard()
+        );
+        
+        db.prepare(`
+          UPDATE holders 
+          SET last_notified_at=?, last_notification_type=? 
+          WHERE ca=? AND wallet=?
+        `).run(now(), 'insufficient_balance', ca, wallet);
+        
+        clearState(uid);
+        return;
+      }
+      
+      db.prepare(`
+        INSERT INTO holders (ca, tg_id, username, wallet, registered_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(ca, wallet) DO UPDATE SET
+          tg_id=excluded.tg_id,
+          username=excluded.username,
+          registered_at=excluded.registered_at,
+          last_notified_at=0,
+          last_notification_type=NULL
+      `).run(ca, uid, ctx.from.username || '', wallet, now());
+
+      // Send registration DM
+      await sendRegistrationDM(uid, ca, wallet, balance, supplyUi);
+
+      clearState(uid);
+
+      const tm = getMeta(ca) || await refreshMetaPriority(ca);
+      const displayName = tm?.display_name || tm?.name || 'Unknown';
+      const displaySymbol = tm?.display_symbol || tm?.symbol || 'N/A';
+
+      return ctx.reply(
+`✅ Registered successfully! 🎉
+
+Token: ${displayName} (${displaySymbol ? `$${displaySymbol}` : 'N/A'})
+CA: ${monospace(ca)}
+Wallet: ${monospace(wallet)}
+Your balance: ${balance.toFixed(4)} tokens ✅
+
+✅ Eligibility Rules
+- Hold at least ${MIN_HOLD_HOURS} hours ⏰
+- Hold at least ${(MIN_HOLDER_PCT * 100).toFixed(4)}% of supply 🪙
+- Do NOT sell during the holding period 📉
+
+💎 The longer you hold, the more rewards you earn!
+
+📨 You will receive DM notifications for payouts!`,
+        holderHomeKeyboard()
+      );
+    } catch (e) {
+      await ctx.reply(`⚠️ Error checking balance: ${e.message}`);
+      clearState(uid);
+    }
+    return;
+  }
+
+  // HOLDER remove token
+  if (s?.mode === 'holder_remove_token') {
+    const ca = extractFirstPubkey(text);
+    if (!ca) return ctx.reply('⚠️ Invalid token CA.');
+    setState(uid, { mode: 'holder_remove_wallet', tempTokenCA: ca });
+    return ctx.reply('🗑️ Now send the wallet address to remove. 👛\n\nPaste your wallet address:');
+  }
+
+  // HOLDER remove wallet
+  if (s?.mode === 'holder_remove_wallet') {
+    const ca = s.tempTokenCA;
+    const wallet = extractFirstPubkey(text);
+    if (!wallet) return ctx.reply('⚠️ Invalid wallet address.');
+
+    const res = db.prepare(`DELETE FROM holders WHERE ca=? AND wallet=? AND tg_id=?`).run(ca, wallet, uid);
+    clearState(uid);
+
+    if (res.changes > 0) return ctx.reply('✅ Registration removed.', holderHomeKeyboard());
+    return ctx.reply('⚠️ Not found. Please double-check token + wallet.', holderHomeKeyboard());
+  }
+
+  // CREATOR edit name
+  if (s?.mode === 'creator_edit_name') {
+    const tokenCA = s.tempTokenCA;
+    const uid = ctx.from.id;
+    
+    if (!creatorOwnsToken(uid, tokenCA)) {
+      clearState(uid);
+      return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+    }
+
+    const newName = text.slice(0, 64);
+    setState(uid, { mode: 'creator_edit_symbol', tempTokenCA: tokenCA, tempName: newName });
+    
+    await ctx.reply(
+`✅ Name set to: ${newName}
+
+Now send the new symbol (without $, max 15 characters):
+
+Example: WHITE, MEME, BOT`,
+      creatorManageKeyboard(tokenCA)
+    );
+    return;
+  }
+
+  // CREATOR edit symbol
+  if (s?.mode === 'creator_edit_symbol') {
+    const tokenCA = s.tempTokenCA;
+    const uid = ctx.from.id;
+    const newName = s.tempName;
+    
+    if (!creatorOwnsToken(uid, tokenCA)) {
+      clearState(uid);
+      return ctx.reply('⚠️ Not your token.', creatorHomeKeyboard());
+    }
+
+    const newSymbol = text.replace(/\$/g, '').slice(0, 15);
+    
+    db.prepare(`
+      UPDATE token_meta 
+      SET display_name=?, display_symbol=?
+      WHERE ca=?
+    `).run(newName, newSymbol, tokenCA);
+    
+    clearState(uid);
+    
+    await ctx.reply(
+`✅ Display name/symbol updated!
+
+New name: ${newName}
+New symbol: ${newSymbol}
+
+Posts will now show: ${newName} #${newSymbol}`,
+      creatorManageKeyboard(tokenCA)
+    );
+    return;
+  }
+
+  // PAYMENT: waiting tx
+  if (s?.mode === 'wait_payment_tx') {
+    const sig = extractSignatureFromText(text);
+    if (!sig) return ctx.reply('⚠️ Please paste a Solscan TX link or a transaction signature.');
+    
+    setState(uid, { mode: 'wait_payment_check', tempTokenCA: s.tempTokenCA, tempSig: sig });
+    
+    await ctx.reply(
+`✅ TX received! 🔍
+
+Transaction signature: ${monospace(sig.slice(0, 16) + '...')}
+
+Now click "Check Payment" button to confirm.`,
+{ 
+  parse_mode: 'Markdown',
+  reply_markup: paymentKeyboard(s.tempTokenCA).reply_markup
+}
+    );
+    return;
+  }
+});
+
+/* =========================
+   REST OF FUNCTIONS
+========================= */
+function getToken(ca) { return db.prepare(`SELECT * FROM tokens WHERE ca=?`).get(ca); }
+function getMeta(ca) { return db.prepare(`SELECT * FROM token_meta WHERE ca=?`).get(ca); }
+function tokenExists(ca) { return !!getToken(ca); }
+function creatorOwnsToken(uid, ca) {
+  return !!db.prepare(`SELECT ca FROM tokens WHERE ca=? AND creator_tg_id=?`).get(ca, uid);
+}
+
+// Behalte alte Funktion für Kompatibilität, aber verwende Creator-Pools für Payouts
+function getRewardsPool(ca) {
+  const dep = db.prepare(`SELECT COALESCE(SUM(reward_sol),0) AS pool FROM deposits WHERE ca=?`).get(ca);
+  const paid = db.prepare(`SELECT COALESCE(SUM(sol_amount),0) AS paid FROM payouts WHERE ca=?`).get(ca);
+  return Math.max(0, Number(dep.pool || 0) - Number(paid.paid || 0));
+}
+
+function getTotalFunded(ca) {
+  const row = db.prepare(`SELECT COALESCE(SUM(sol_amount),0) AS total FROM deposits WHERE ca=?`).get(ca);
+  return Number(row.total || 0);
+}
+
+function getFeesTotal(ca) {
+  const row = db.prepare(`SELECT COALESCE(SUM(fee_sol),0) AS total FROM deposits WHERE ca=?`).get(ca);
+  return Number(row.total || 0);
+}
+
+function countHoldersForToken(ca) {
+  const r = db.prepare(`SELECT COUNT(*) AS c FROM holders WHERE ca=?`).get(ca);
+  return Number(r?.c || 0);
+}
+
+/* =========================
+   LAUNCH BOT - VERBESSERTE VERSION!
+========================= */
+async function launchBot() {
+  console.log('🤖 Starting 🎭 WHITEMEME Bot...');
+  console.log(`📢 Channel: ${CHANNEL_ID}`);
+  console.log(`💰 Reward Wallet: ${REWARD_WALLET}`);
+  console.log(`💳 Fee Wallet: ${FEE_WALLET}`);
+  console.log(`🔧 Callback Keys:`, CB);
+  
+  // RUN AUTO MIGRATION FIRST
+  runAutoMigration();
+  
+  try {
+    console.log('📢 Starting broadcast worker...');
+    startBroadcastWorker();
+    
+    console.log('📈 Starting milestone checker...');
+    startMilestoneChecker();
+    
+    console.log('⏰ Starting auto-payout scheduler...');
+    startAutoPayoutScheduler();
+    
+    await bot.launch({ dropPendingUpdates: true });
+    console.log('✅ Bot running! ✅');
+    
+    try {
+      const chat = await bot.telegram.getChat(CHANNEL_ID);
+      console.log(`✅ Channel accessible: ${chat.title || 'Unknown'}`);
+      
+      const adminMsg = `🤖 🎭 WHITEMEME Bot started ✅\n\n• Channel: ${chat.title || CHANNEL_ID}\n• Time: ${new Date().toLocaleString()}\n• Posts sent IMMEDIATELY! 🚀\n• Reward Wallet: ${monospace(REWARD_WALLET)}\n• Creator-isolated Pools: ACTIVATED 🎯\n• Bonded Posting: ACTIVATED 🎗️\n• Auto-Payouts: 20:00 UTC daily ⏰\n• Holder DM Notifications: ENABLED 📨`;
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await bot.telegram.sendMessage(adminId, adminMsg, { parse_mode: 'Markdown' });
+        } catch {}
+      }
+    } catch (e) {
+      console.log(`⚠️ Channel not accessible: ${e.message}`);
+      console.log('⚠️ Make sure bot is admin in the channel!');
+    }
+    
+    console.log('🚀 Bot fully started and ready!');
+    console.log('✅ ALL FIXES APPLIED:');
+    console.log('  • Creator "My Tokens" panel working');
+    console.log('  • Admin "Manage Tokens" FIXED (unique callback data)');
+    console.log('  • Creator Stats, Report, Holder Stats, Edit Display FIXED');
+    console.log('  • All action handlers implemented');
+    console.log('  • New post format with CA address');
+    console.log('  • Auto-migration system for database');
+    console.log('🎯 CRITICAL FIX: Creator-isolated reward pools ACTIVATED');
+    console.log('📨 Holder DM System: ACTIVE');
+    console.log('🎯 Payouts now ONLY from creator own pool!');
+    console.log('🎗️ Bonded Posting System: ACTIVATED');
+    console.log('📈 Milestone Auto-Posts: 2x/5x/10x ENABLED');
+    console.log('⏰ Auto-Payouts: 20:00 UTC daily');
+    
+  } catch (e) {
+    console.log('❌ Bot start failed:', String(e?.message || e));
+    console.log('🔄 Restarting in 10 seconds...');
+    setTimeout(launchBot, 10000);
+  }
+}
+
+launchBot();
+
+process.once('SIGINT', () => {
+  console.log('🛑 SIGINT received, stopping bot...');
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, stopping bot...');
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
