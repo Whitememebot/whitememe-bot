@@ -1569,13 +1569,13 @@
 # ========================
 # BOT CONFIG (NEUE WERTE!)
 # ========================
-BOT_TOKEN=Your Token 
+
 CHANNEL_ID=-1003522620534
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=your key
+RPC_URL=https://mainnet.helius-rpc.com/?api-key=
 # ========================
 # WALLETS (NEUE WALLETS!)
 # ========================
-PAYOUT_SECRET_BASE58=your scret base
+PAYOUT_SECRET_BASE58=
 FEE_WALLET=589LVZTEmg2a4TtQpwd3Eu54khDfQKPBBBH23SusfHxi
 
 # ========================
