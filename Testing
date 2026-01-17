@@ -1,0 +1,5 @@
+# Run tests
+npm test
+
+# Run with coverage
+npm run test:coverage
